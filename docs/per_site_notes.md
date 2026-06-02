@@ -847,6 +847,34 @@ First async smoke at concurrency=5 worked. Subsequent runs returned **HTTP 502 o
 
 **2026-05-30 — Hit cache (cuts subsequent monthly runs from 3.5h → ~15 min)**
 
+### ZF_USE_CACHE — when to set 0 vs 1 (read this first)
+
+`ZF_USE_CACHE` is the single env var controlling cache behavior. **What writes to the cache is always-on**; what changes is whether the next run reads from it.
+
+| Value | What it does | When to use |
+|---|---|---|
+| **`ZF_USE_CACHE=0`** | **Full discovery.** Walks ALL `(mfr, model, variant, AG)` tuples from scratch — ~30,000 API calls × ~0.65 s each = ~3.5 h wall-clock. Writes `output/<date>/zf_hit_cache.json` at end of run, replacing any previous cache. | • The very first time ZF runs after install (no cache exists yet)<br/>• Every **3 months** as a refresh (catches any new parts ZF added to previously-empty tuples — see "Why refresh" below)<br/>• Anytime ZF's row count drops dramatically vs the prior cached run (signal that the cache has gone stale or ZF changed IDs)<br/>• When debugging: cache-on can mask a regression |
+| **`ZF_USE_CACHE=1`** | **Cached run.** Loads the most-recent `zf_hit_cache.json` from `output/<prev-date>/`, calls ONLY the ~960 productive tuples logged there, skips the 28,880 known-empty ones. ~15 minutes wall-clock. Still writes a fresh cache at end (which will be ~identical to the input cache since the hit set rarely shifts). | • Normal monthly cron runs in months **2, 3, 4, 5, 6, 7, 8, 9, 10, 11** after a discovery run<br/>• Anytime you want a fast ZF refresh and can accept missing any newly-added parts since the last discovery |
+
+### Why refresh every 3 months
+
+ZF's catalog grows incrementally. The cache mode is **asymmetric**:
+- **Stale entries** (tuples that USED to have parts but no longer do) → cheap. Cache makes 1 wasted API call returning empty; ~150 ms per stale tuple. Harmless.
+- **Missing new entries** (tuples that ZF NEWLY populated since last discovery) → **invisible**. Cache mode never asks those tuples, so the data stays missing in our output until the next full discovery rewrites the cache.
+
+For Indian PV makes the catalog is stable enough that monthly cache runs work fine, but the 3-month full discovery is insurance against silently missing additions.
+
+### Decision rule the cron operator follows
+
+```
+First Monday of Jan/Apr/Jul/Oct      → ZF_USE_CACHE=0   (quarterly refresh)
+First Monday of every other month    → ZF_USE_CACHE=1   (cached fast run)
+```
+
+Or simpler: keep `ZF_USE_CACHE=1` in `/etc/environment` always, and **manually flip to 0 for the run 4× per year** when doing the quarterly refresh.
+
+---
+
 The mfr-whitelist (105→20) and async (C=3) optimizations brought ZF to 3.5h. The remaining cost was 96.8% empty `getArticlesForFilter` responses — 28,880 of 29,840 calls return `content:[]`. Most (mfr, model, variant, AG) tuples have no parts; we just can't tell without asking.
 
 **Solution**: persist the ~960 productive tuples from each successful run and skip the known-empty ones on subsequent runs.

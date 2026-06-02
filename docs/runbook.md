@@ -16,7 +16,8 @@ The monthly run is fully automated via cron. You only intervene on failure. Rout
 |---|---|---|
 | Tuesday morning after first Monday | Email subject `[Spinny Crawler]` arrives only if something is wrong | Inbox of the recipient list in `config/alerts.yaml` |
 | If email arrives | Open `run_summary_<YYYYMMDD>.json` in shared cloud folder | path TBD at kickoff |
-| If no email arrives | Quick spot-check: master CSV exists, row count is in expected range (~12K rows once all 19 brands ship) | shared cloud folder |
+| If no email arrives | Quick spot-check: master CSV exists, row count is in expected range (~120K rows once all 26 brands ship) | shared cloud folder |
+| First Monday of **Jan / Apr / Jul / Oct** | Flip `ZF_USE_CACHE=0` in `/etc/environment` BEFORE the 22:00 IST trigger (quarterly ZF discovery refresh). After the run completes Tuesday morning, flip back to `ZF_USE_CACHE=1`. See [per_site_notes.md §20](per_site_notes.md) for the rationale. | `/etc/environment` on the VM |
 
 ---
 
