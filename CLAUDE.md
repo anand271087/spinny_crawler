@@ -2,9 +2,15 @@
 
 Instructions for any Claude session working in this repo. Read this first.
 
+**Repository**: https://github.com/anand271087/spinny_crawler  (public)
+
 ## What this is
 
 Monthly batch crawler that extracts passenger-vehicle spare-parts catalogue data from **19 OEM/aftermarket-brand websites** for Spinny, plus **7 additive OEM EPC sources** added under v2.0 scope (Maruti, Hyundai, Toyota, Mahindra, MG, Tata, Ford). Runs via Linux cron on a Spinny-provided VM. Output → shared cloud folder (S3/GDrive/SharePoint — TBD at kickoff).
+
+## Secrets policy (public repo)
+
+**No credentials may be committed.** All dealer logins and SMTP passwords come from env vars per the `.env.example` template. The `.env` file is gitignored. When adding a new spider that needs auth, follow the `lib/credentials.py::Credentials.load(brand_key)` pattern — never hardcode fallback strings.
 
 ## Sources of truth — read these before changing anything
 
