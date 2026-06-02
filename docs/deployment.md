@@ -204,7 +204,7 @@ If any spider fails to import, do not proceed — investigate with the runbook.
 
 ## 4. Credentials and secrets (~5 min)
 
-Some brands require dealer credentials. The codebase ships with FALLBACK credentials hardcoded in each spider (from the original xlsx handover), but the recommended pattern is to override via environment variables.
+Six of the 26 brands require dealer credentials (the other 20 have public catalogs). The codebase ships with **NO hardcoded credentials** — public-repo policy. All credentials must be supplied via environment variables. Spinny provides the actual values out-of-band; the [.env.example](../.env.example) file at the repo root is the template.
 
 ### 4.1 Credentials currently in scope
 
