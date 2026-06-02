@@ -1,0 +1,9 @@
+# Spinny OEM Crawler — monthly schedule.
+# Run: first Monday of every month, 22:00 IST. Window per BRD §8: 22:00 IST → 06:00 IST Tuesday.
+# Install on VM: `crontab -e` then paste below. Verify with `crontab -l`.
+
+# Minute Hour Day-of-month Month Day-of-week  Command
+0 22 1-7 * 1 /opt/spinny_crawler/cron/run_monthly.sh >> /var/log/spinny_crawler/cron.log 2>&1
+
+# Weekly canary (early DOM-change warning) — Sundays 03:00 IST against a small subset
+0 3 * * 0 /opt/spinny_crawler/cron/canary.sh >> /var/log/spinny_crawler/canary.log 2>&1

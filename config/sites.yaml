@@ -1,0 +1,208 @@
+# Spinny OEM Crawler — per-brand configuration.
+# Source of truth: companion xlsx ("Spinny Catalog OES Datasources").
+# Plan reference: see .planning/plans/understand-the-requirements-from-vast-floyd.md §12
+
+brands:
+
+  hella:
+    url: https://shop4hella.com/listing/4-wheeler
+    pattern: multi_level_category
+    fields: [item_name, item_code, mrp]
+    notes: "Iterate Sub Business Segment (PCA, PCS) → category → products"
+
+  uno_minda:
+    url: https://unomindakart.com/
+    pattern: multi_level_category
+    fields: [item_name, item_code, mrp]
+    notes: "Homepage CTA → products-by-segment → car → iterate tabs"
+
+  technix:
+    url: https://technixauto.com/
+    pattern: flat_list
+    fields: [item_name, item_code, mrp]
+    notes: "Unfiltered search → results across tabs → paginate"
+
+  gabriel:
+    url: https://www.anandgroupindia.com/gabrielindia/aftermarkets/?pcatid=all&vcatid=passenger-vehicle
+    pattern: pdf_brochure  # site landing is marketing only; actual catalogue is downloadable PDF
+    fields: [item_name, item_code, mrp]
+    vehicle_segment_gate: true
+    notes: "PDF catalogue at /wp-content/uploads/.../GIL-All-Products-Catalogue-*.pdf — scoped via PDF index page-ranges + row-level 2W/3W/CV filter"
+
+  zip:
+    url: https://www.zipfilters.com/
+    pattern: multi_level_category
+    fields: [item_name, item_code, mrp]
+    notes: "6 product sub-sections on homepage"
+
+  monroe:
+    url: https://www.bksmotors.com/brand/monroe
+    pattern: flat_list
+    fields: [item_name, item_code, mrp]
+    notes: "BKS Motors reseller; strip srsltid Google referral param"
+
+  amaron:
+    url: https://www.amaron.com/passenger-vehicles
+    pattern: cascading_dropdown
+    fields: [item_name, item_code, mrp]
+    dropdowns: [make, model, fuel]
+    notes: "Battery finder; intercept XHR API for combinations"
+
+  sf_sonic:
+    url: https://www.sfbatteries.in/battery-finder/4w-battery/
+    pattern: cascading_dropdown
+    fields: [item_name, item_code, mrp]
+    dropdowns: [brand, model, fuel]
+
+  exide:
+    url: https://www.exideindustries.com/products/automotive-batteries/four-wheeler-batteries.aspx
+    pattern: pdf_brochure  # switched 2026-05-19 — MRP source is the official monthly MRP-list PDF
+    fields: [item_name, item_code, mrp]
+    mrp_pdf_url: https://docs.exideindustries.com/pdf/mrp-list/mrcp-exide-vehicular-and-2wl-batteries.pdf
+    notes: "Cracked 2026-05-19: PDF-driven catalogue with MRP. 53 PV batteries across 9 families. See docs/per_site_notes.md §2"
+
+  spark_minda:
+    url: https://mcl-aftermarket.com/Product/ProductServices
+    pattern: multi_level_category  # static HTML; /Product/ProductDetail?typeid=2&producGrouptId=<sid>
+    fields: [item_name, item_code, mrp]
+    vehicle_segment_gate: true  # typeid=2 = 4 Wheeler
+    notes: "Cracked 2026-05-19: URL-driven (was form-stub). httpx + parsel; ~10s full crawl. See docs/per_site_notes.md §18"
+
+  schaeffler:
+    url: https://vehiclelifetimesolutions.schaeffler.in/en-gb/catalog
+    pattern: json_api_pagination  # Spartacus OCC backend at /api/Repxpert-IN/products/search
+    fields: [item_name, item_code, mrp]
+    notes: "WAF bypassed via Chrome 131 fingerprint headers (Sec-Fetch-*, sec-ch-ua-*). Backend is SAP Commerce/RepXpert-IN. ~17,778 PV products via targetTypes:passengerCar filter. MRP empty (catalogStatus=on_demand) so rows are partial per BRD §7. See docs/per_site_notes.md §14"
+
+  autokoi:
+    url: https://www.autokoi.com/products/
+    pattern: hidden_nav
+    fields: [item_name, item_code, mrp]
+    notes: "Click hamburger (top-right) → E-catalogue"
+
+  bosch:
+    url: https://ap.boschaftermarket.com/in/en/parts/
+    pattern: pdf_brochure
+    fields: [item_name, item_code, mrp]
+    notes: "Open category → Downloads tab → parse brochure PDF"
+
+  valeo:
+    url: https://www.valeoservice.in/en-in/passenger-car
+    techassist_url: https://www.valeoservice.in/en-in/techassist  # actual catalogue URL (2026-05-19)
+    pattern: rest_api  # Next.js + TecAssist REST; was `breakage_stub` until 2026-05-19
+    fields: [item_name, item_code, compatible_car_model]
+    notes: "Cracked 2026-05-19: TecAssist API at api.valeoservice-techassist.com. 5,286 unique articles with OEM cross-refs. See docs/per_site_notes.md §10"
+
+  zf:
+    url: https://aftermarket.zf.com/en/aftermarket-portal/our-catalog/search-by-vehicle/
+    pattern: json_api_pagination  # /functions/controller/opc/* REST API (Vue SPA backend)
+    fields: [item_name, item_code, compatible_car_model]
+    dropdowns: [manufacturer, model, vehicle, variant, product_group]
+    vehicle_segment_gate: true  # vehicleTypeIDs=P
+    geography_gate: { languageID: 4, countryID: IND }
+    notes: "Cracked 2026-05-19: API discovered via Vue bundle. Chain: getManufacturers → getModels → getGroupedVehicles → getAllPictureAssemblyGroups → getArticlesForFilter. 105 PV mfrs accessible. See docs/per_site_notes.md §20"
+
+  lumax:
+    url: https://www.lumaxworld.in/aftermarket/product-catalogue.html
+    pattern: pdf_brochure  # site landing has PDF links only; 4W price-list PDF is canonical
+    fields: [item_name, item_code]  # MRP also extracted as bonus
+    skip_categories: ["2w_*"]
+    notes: "Auto-discovers latest 4W-price-list-*.pdf anchor; PDF Material Code = item_code"
+
+  jk_tyre:
+    url: https://www.jktyre.com/pcr
+    pattern: multi_level_category  # /pcr/<segment>/<make>/tyre-details/<slug>
+    fields: [item_name, compatible_car_model, tyre_sizes]
+    vehicle_segment_gate: true  # /pcr tree is passenger-only by construction
+    notes: "Cracked 2026-05-19: static URL tree under /pcr/ replaces the RSC tyre-finder. httpx + parsel; ~3 min full crawl. See docs/per_site_notes.md §15"
+
+  tvs_girling:
+    url: https://partscatalogue.brakesindia.com/
+    pattern: cascading_dropdown  # URL 1 cracked 2026-05-19 (ASP.NET WebForms + UpdatePanel)
+    fields: [item_name, item_code, mrp, vehicle_compatibility]
+    urls:
+      - url: https://partscatalogue.brakesindia.com/
+        pattern: cascading_dropdown
+        fields: [item_name, item_code, mrp, vehicle_compatibility]
+        dropdowns: [make, segment, model, year_type]
+        filter: "segment in [CAR, MUV/SUV]"
+        status: shipped
+      - url: https://www.tvsgirling.com/passenger-cars-scv/
+        pattern: multi_level_category
+        fields: [item_name]
+        sub_brands: [Girling, Apache, Sprinter]
+    output: merged
+    source_website_distinguishes: true
+
+  mobil:
+    url: https://www.mobil.co.in/en-in/our-products#sort=relevancy
+    pattern: flat_list
+    fields: [item_name]
+
+  # ────────────────────────────────────────────────────────────────
+  # v2.0 OEM EPC scope (per Spinny Catalog OES Datasources 2.0)
+  # ────────────────────────────────────────────────────────────────
+  maruti:
+    url: https://www.marutisuzuki.com/genuine-parts
+    pattern: json_api_pagination
+    fields: [item_name, item_code, mrp]  # compatible_car_model not available from unfiltered API
+    auth: none  # public site
+    priority: 1
+    notes: "POST /api/sitecore/MSGP/GetFilter; double-decoded JSON; ~29K products; partial because car_model needs per-model iteration"
+
+  hyundai:
+    url: https://snaponepc.com/epc/
+    pattern: snapon_epc  # SNAP-ON platform, shared with Toyota
+    fields: [item_name, item_code, mrp, compatible_car_model]
+    auth: env_vars  # HYUNDAI_USER, HYUNDAI_PASS — see .env.example
+    priority: 2
+    notes: "Login works; sbsepc5acs anti-CSRF token blocks data endpoints — see spiders/hyundai.py for status"
+
+  toyota:
+    url: https://snaponepc.com/epc/
+    pattern: snapon_epc  # same platform as Hyundai
+    fields: [item_name, item_code, mrp, compatible_car_model]
+    auth: env_vars  # TOYOTA_USER, TOYOTA_PASS — see .env.example
+    priority: 4
+    notes: "Catalog OK; MRP empty server-side (TKM_TOY price book unpopulated for current dealer). See docs/per_site_notes.md §V2.3"
+
+  mahindra:
+    url: https://mahindra-ecat.com/epcview/login
+    pattern: cascading_dropdown  # Intelli Catalogue tree (CategoryType → Category → Model → ...)
+    fields: [item_name, item_code, compatible_car_model]
+    auth: env_vars  # MAHINDRA_USER, MAHINDRA_PASS — see .env.example
+    priority: 3
+    notes: "BRD §7 captcha blocker solved via offline ddddocr OCR (free, no SaaS). Tree at /api/Quick/getFavTree exposes ~565 models across 4 CategoryTypes; spider filters to Passenger Vehicles per BRD. Parts-leaf drill TODO. See docs/per_site_notes.md §V2.4"
+
+  mg:
+    url: https://serviceconnect.mgmotorindia.com/epc/login
+    pattern: cascading_dropdown  # Intelli Catalogue v11.0 (same as Mahindra); OCR-bypass captcha
+    fields: [item_name, item_code, compatible_car_model]
+    auth: env_vars  # MG_USER, MG_PASS — see .env.example
+    priority: 5
+    notes: "Identical Intelli Catalogue v11.0 platform as Mahindra. Captcha solved via offline ddddocr. No User Type dropdown (vs Mahindra). Tree via /api/Quick/getFavTree → Passenger Vehicles filter. Parts-leaf drill TODO. See docs/per_site_notes.md §V2.5"
+
+  tata:
+    url: https://www.tatamotorsecats.com/frmTATAModelSearch.aspx
+    pattern: cascading_dropdown  # ASP.NET WebForms; 7-level cascade → catalogue → TreeView → artbom URL
+    fields: [item_name, item_code, mrp, compatible_car_model]
+    auth: env_vars  # TATA_USER, TATA_PASS — see .env.example
+    priority: 6
+    notes: "Login + 7-dropdown cascade reaches /frmtataadminmodelnew.aspx; categories via TreeView expand (partial postback delta); illustrations open as /frmtataartbomnew.aspx?ID=1_<illId>. Parts table columns: ITEM | PART NO. | PART DESCRIPTION | QTY | RATE | REMARKS. See docs/per_site_notes.md §V2.6"
+
+  ford:
+    url: https://microcat-apac.superservice.com/content/microcat-epc/
+    pattern: json_api_pagination  # Microcat REST: history → section tree → sectionparts
+    fields: [item_name, item_code, compatible_car_model]
+    auth: env_vars  # FORD_USER, FORD_PASS — see .env.example
+    priority: 7
+    notes: "Login (login.superservice.com) → capture Bearer JWT from SPA, replay /v2/history/vehicles, /v3/section/<vid>/children?id=<sid>, /v1/part/<vid>/sectionparts/<leafId>. No MRP per xlsx. Scope limited to ~15 vehicles in account history (catalog/list works but vehicleId needs VIN). See docs/per_site_notes.md §V2.7"
+
+# Field-map: xlsx label → output column name. Locked at kickoff.
+field_map:
+  "Item Name": item_name
+  "Item Code": item_code
+  "MRP": mrp
+  "Compatible with which car model": compatible_car_model
+  "Tyre Sizes available": tyre_sizes
+  "Vehicle Information (Compatibility)": vehicle_compatibility

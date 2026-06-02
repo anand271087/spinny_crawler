@@ -1,0 +1,16 @@
+smtp:
+  host: smtp.spinny.internal      # TBD at kickoff
+  port: 587
+  username: spinny-crawler
+  password_env: SMTP_PASSWORD     # read from env, not committed
+
+from_address: spinny-crawler@spinny.com
+
+recipients:                       # TBD at kickoff
+  - catalog-ops@spinny.com
+  - data-eng-oncall@spinny.com
+
+triggers:
+  per_spider_failure: true        # fires on crawl_status=failed
+  end_of_run_below_98: true       # fires if monthly success < 98%
+  dom_change: true                # fires when selector-output hash diverges

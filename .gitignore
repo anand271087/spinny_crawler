@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Runtime outputs (large; uploaded to cloud per BRD §8)
+output/
+
+# Captured tokens / sessions / probes (may contain credentials)
+state/
+
+# Logs
+*.log
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# Build
+build/
+dist/
+
+# Claude session metadata
+.claude/
