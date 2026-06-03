@@ -198,6 +198,12 @@ class Spider(BaseSpider):
         self.max_leaves_per_branch = int(
             os.environ.get(f"{brand_key.upper()}_MAX_LEAVES", "0") or "0"
         )
+        # MRP fetch (UI-driven, slow): drill UI into each section + click first
+        # part to warm SPA state + parallel-fetch supersession for all parts.
+        # Off by default; enable per-run via HYUNDAI_FETCH_MRP=1.
+        self.fetch_mrp = bool(int(
+            os.environ.get(f"{brand_key.upper()}_FETCH_MRP", "0") or "0"
+        ))
 
     def crawl(self) -> list[Row]:
         log.info("%s: REST spider crawl() entered", self.brand_key)
@@ -359,11 +365,24 @@ class Spider(BaseSpider):
                             seen_part_ids.add(pid)
                         new_parts.append(p)
 
-                    # MRP fetch is DISABLED — see module docstring "MRP STATUS"
-                    # for the full investigation. TL;DR: validatePart needs SPA
-                    # UI-click session state we couldn't replicate outside the
-                    # browser-driven click flow. Rows ship as `partial` for now.
+                    # MRP fetch: UI-drill the SPA into the section (warms server-
+                    # side session state), then parallel browser-fetch supersession
+                    # for all parts. See module docstring "MRP STATUS" for details.
                     mrp_map: dict[str, Optional[float]] = {}
+                    if new_parts and new_catalog_id and self.fetch_mrp:
+                        log.info("MRP: leaf crumb=%r catalog_id=%s, parts=%d",
+                                 new_crumb[:5], new_catalog_id, len(new_parts))
+                        fr_leaf = self._build_filter_request(
+                            ds_id, price_book_id, user_id, new_catalog_id
+                        )
+                        # UI drill to set SPA section state — one click trail per leaf
+                        warmed = self._warm_section_ui(new_crumb[:5])
+                        if warmed:
+                            mrp_map = self._fetch_mrps_via_browser(
+                                ds_id, fr_leaf, new_parts, user_id, leaf_sp=node_sp,
+                            )
+                            mrp_lookups += len(new_parts)
+                            mrp_hits += sum(1 for v in mrp_map.values() if v is not None)
 
                     for p in new_parts:
                         pid = p.get("partId", "")
@@ -413,6 +432,86 @@ class Spider(BaseSpider):
         )
         return _b64(raw)
 
+    def _warm_section_ui(self, breadcrumb: list[str]) -> bool:
+        """Drive Playwright UI clicks to set the SPA's section state, then click
+        the first part-number to trigger supersession (which warms the per-section
+        state for all subsequent supersession fetches).
+
+        breadcrumb = [year, model, catalog, group, section]. We re-navigate from
+        /epc/#/ each time — simpler than diffing against the prior section, ~5s
+        per nav. Returns True if drill succeeded all the way to section.
+
+        After this returns True, supersession can be called for any partId
+        belonging to this section via in-browser fetch (see _fetch_mrps_via_browser).
+        """
+        page = self._pw_ctx.pages[0]
+        try:
+            # Reset to home so the next click sequence starts from a known state.
+            page.goto(f"{BASE}/epc/#/", wait_until="domcontentloaded", timeout=15_000)
+            page.wait_for_timeout(4000)
+        except Exception as e:
+            log.warning("warm: home goto err: %s", e)
+            return False
+        # Click the dataset tile (Hyundai/Toyota) — first thumbnail on home.
+        try:
+            page.locator('[class*="thumbnail"]').first.click(timeout=5000)
+            page.wait_for_timeout(4000)
+        except Exception:
+            pass
+        # Drill through breadcrumb levels by matching visible text. Names can
+        # include special chars (zero-width spaces in model names like
+        # 'ACCENT/​ACCENT BLUE/​VERNA/​PONY'); we try exact text first, then a
+        # partial-text fallback.
+        for level_idx, name in enumerate(breadcrumb):
+            clicked = False
+            # Strip zero-width chars for partial-match fallback
+            short = ''.join(c for c in name if c.isalnum() or c in ' -/')[:24]
+            for sel in (
+                f"text='{name}'",
+                f'[class*="thumbnail"]:has-text("{short}")',
+                f'text=/{short}/',
+            ):
+                try:
+                    el = page.locator(sel).first
+                    if el.count() == 0:
+                        continue
+                    el.click(timeout=5000)
+                    page.wait_for_timeout(4500)
+                    clicked = True
+                    log.info("warm: clicked level %d (%r) via %s", level_idx, name[:30], sel[:40])
+                    break
+                except Exception:
+                    continue
+            if not clicked:
+                log.warning("warm: failed at level %d (%r)", level_idx, name[:50])
+                return False
+        # Click the part-number — opens part-detail view — SPA fires supersession.
+        # Capture the SPA's exact supersession URL + headers; we'll re-use the URL
+        # verbatim, only swapping pr=<partId> for each part we want to price.
+        # (Verified working pattern: state/probe_supersession_per_section.py.)
+        captured = {"url": None, "headers": None}
+        def on_super(req):
+            if not captured["url"] and "/partdetails/supersession" in req.url:
+                captured["url"] = req.url
+                captured["headers"] = dict(req.headers)
+        page.on("request", on_super)
+        try:
+            page.locator('.ag-cell[col-id="formattedPartNumber"] a').first.click(timeout=8000)
+            page.wait_for_timeout(5000)
+            page.remove_listener("request", on_super)
+            if captured["url"] and captured["headers"]:
+                self._last_spa_super_url = captured["url"]
+                self._spa_super_headers = captured["headers"]
+                log.info("warm: captured SPA supersession URL + headers (%d hdrs)",
+                         len(captured["headers"]))
+                return True
+            log.warning("warm: no supersession XHR captured after part-number click")
+            return False
+        except Exception as e:
+            page.remove_listener("request", on_super)
+            log.warning("warm: part-number click err: %s", e)
+            return False
+
     def _fetch_mrps_via_browser(
         self,
         ds_id: str,
@@ -441,52 +540,51 @@ class Spider(BaseSpider):
         if not parts:
             return result
 
-        # MUST match the SPA's full header set — including sec-ch-ua client hints
-        # and user-agent — captured from the live add-to-picklist click. Without
-        # the full set, the WAF returns 400 (verified 2026-06-03).
-        req_headers = {
-            "accept": "application/json, text/plain, */*",
-            "amg": user_id,
-            "cache-control": "no-cache,no-store",
-            "expires": "0",
-            "pragma": "no-cache",
-            "referer": f"{BASE}/epc/",
-            "sec-ch-ua": '"HeadlessChrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "sec-ch-ua-platform-version": '"10.15.7"',
-            "user-agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "HeadlessChrome/147.0.0.0 Safari/537.36"
-            ),
-            **self._auth_headers,
-        }
-
-        js = """async ({pairs, headers, warmUrl}) => {
-            // Warm the session: browser GET the section's parts page so the
-            // SPA's server-side state knows we're "viewing" this leaf. Without
-            // this warm, validatePart returns 400 even with all correct headers.
-            const out = {};
-            const debug = {firstStatus: null, firstBody: null, errors: 0, warmStatus: null};
-            try {
-                const warmResp = await fetch(warmUrl, {credentials: 'include', headers});
-                debug.warmStatus = warmResp.status;
-            } catch (e) {
-                debug.warmStatus = 'err: ' + e.message;
+        # Use the FRESHLY-CAPTURED SPA headers from _warm_section_ui — those
+        # include sbsepc5s/cs that may have been refreshed since login, plus
+        # all the sec-ch-ua/user-agent quirks the WAF expects.
+        if getattr(self, "_spa_super_headers", None):
+            req_headers = {k: v for k, v in self._spa_super_headers.items()
+                           if not k.lower().startswith("content-length")}
+        else:
+            # Fallback: synthesize from login-time headers (may fail if stale)
+            req_headers = {
+                "accept": "application/json, text/plain, */*",
+                "amg": user_id,
+                "cache-control": "no-cache,no-store",
+                "expires": "0",
+                "pragma": "no-cache",
+                "referer": f"{BASE}/epc/",
+                "user-agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                **self._auth_headers,
             }
-            const results = await Promise.all(pairs.map(async ([url, pid], i) => {
+
+        # JS: take the SPA's captured baseUrl, swap `pr=<partId>` for each
+        # request, fire in parallel. MRP comes from prices[].priceType==MOB_MRP_A.
+        # Pattern proven working in state/probe_supersession_per_section.py.
+        js = """async ({baseUrl, partIds, headers}) => {
+            const out = {};
+            const debug = {firstStatus: null, firstBody: null, errors: 0};
+            const results = await Promise.all(partIds.map(async (pid, i) => {
+                const u = new URL(baseUrl);
+                u.searchParams.set('pr', pid);
                 try {
-                    const r = await fetch(url, {credentials: 'include', headers});
+                    const r = await fetch(u.toString(), {credentials: 'include', headers});
                     if (i === 0) {
                         debug.firstStatus = r.status;
-                        debug.firstBody = (await r.clone().text()).slice(0, 400);
+                        debug.firstBody = (await r.clone().text()).slice(0, 300);
                     }
                     if (!r.ok) return [pid, null];
                     const data = await r.json();
-                    const prices = data.prices || [];
-                    const mrp = prices.find(p => p.priceType === 'MOB_MRP_A');
-                    return [pid, mrp ? mrp.amount : null];
+                    // Supersession returns supersessionData[] or similar; look for
+                    // prices[] anywhere in the response by JSON-walk.
+                    const txt = JSON.stringify(data);
+                    const m = txt.match(/"priceType":"MOB_MRP_A","amount":"([^"]+)"/);
+                    return [pid, m ? m[1] : null];
                 } catch (e) {
                     debug.errors++;
                     return [pid, null];
@@ -496,40 +594,42 @@ class Spider(BaseSpider):
             return {out, debug};
         }"""
 
+        # Use the SPA's exact captured supersession URL as the base. Only swap
+        # `pr=<partId>` per part — keeps every byte of the SPA-built fr (with
+        # equipmentRefId), every query-param order, etc.
+        base_url = getattr(self, "_last_spa_super_url", None)
+        if not base_url:
+            log.warning("MRP: no SPA-captured URL — skipping leaf")
+            return result
+
         # Process in batches to avoid huge single page.evaluate args.
         for start in range(0, len(parts), batch_size):
             chunk = parts[start : start + batch_size]
             pairs = []
             for p in chunk:
                 pid = p.get("partId", "")
-                piid = p.get("partItemId", "")
-                if not pid or not piid:
+                if not pid:
                     continue
-                url = (
-                    f"{BASE}/epc-services/picklist/validatePart/datasetId/{ds_id}/"
-                    f"filterRequest/{fr_leaf}/partId/{pid}/partItemId/{piid}"
-                )
-                pairs.append([url, pid])
+                pairs.append([pid])  # only partId — URL is built JS-side from base
             if not pairs:
                 continue
-            warm_url = (
-                f"{BASE}/epc-services/datasets/{ds_id}/pages/parts/{leaf_sp}/"
-                f"filterRequest/{fr_leaf}"
-                if leaf_sp else ""
-            )
             try:
-                page = self._pw_ctx.pages[0]  # the login page is still alive
+                page = self._pw_ctx.pages[0]
+                # Pairs is [[partId], ...] — extract flat partIds list
+                part_ids_chunk = [p[0] for p in pairs]
                 batch_result = page.evaluate(js, {
-                    "pairs": pairs, "headers": req_headers, "warmUrl": warm_url,
+                    "baseUrl": base_url,
+                    "partIds": part_ids_chunk,
+                    "headers": req_headers,
                 })
             except Exception as e:
-                log.warning("validatePart batch err: %s", e)
+                log.warning("supersession batch err: %s", e)
                 continue
-            if start == 0:  # log debug from first batch only
+            if start == 0:
                 debug = (batch_result or {}).get("debug", {})
-                log.info("MRP first-batch debug: warm=%s status=%s firstBody=%r errors=%s",
-                         debug.get("warmStatus"),
-                         debug.get("firstStatus"), (debug.get("firstBody") or "")[:200],
+                log.info("MRP first-batch debug: status=%s firstBody=%r errors=%s",
+                         debug.get("firstStatus"),
+                         (debug.get("firstBody") or "")[:200],
                          debug.get("errors"))
             for pid, amt in (batch_result or {}).get("out", {}).items():
                 try:
