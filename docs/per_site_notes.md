@@ -1099,7 +1099,37 @@ The `{sp}` parameter is a base64-encoded `serializedPath` cursor returned in the
 - Always extract `sbsepc5s` + `sbsepc5cs` from the FIRST `/auth/account` request headers. Don't try to derive `sbsepc5cs` from the JWT — the SPA's JS does that, we don't need to.
 - Use `httpx.Client` (not AsyncClient) for SNAP-ON — endpoints are fast and serial walking respects pagination; async doesn't help.
 
-**Pending**: layer in MRP via picklist API (`POST /epc-services/picklist/validatePart`) so rows can ship as `success` instead of `partial`.
+**Pending — MRP via picklist API (2026-06-03 partial investigation)**:
+
+We attempted to wire MRP fetch via `GET /epc-services/picklist/validatePart/datasetId/<ds>/filterRequest/<fr>/partId/<pid>/partItemId/<piid>`. The endpoint exists and returns:
+```json
+"prices": [
+  {"priceType":"MOB_LIST","amount":"863.14","currency":"INR"},
+  {"priceType":"MOB_MRP_A","amount":"1079.00","currency":"INR"},
+  {"priceType":"MSRP","amount":"1079.00","currency":"INR"},
+  ...
+]
+```
+when called from inside the live SPA session (Playwright). The desired field is `MOB_MRP_A` (Hyundai dealer-zone A).
+
+**What's required**:
+1. `equipmentRefId=<catalog_id>` baked into the filterRequest (numeric id of the parent "Catalog" level navigation node — e.g. 7649 for IHMIP0Y24 VERNA 24). The spider's DFS now tracks this, plumbing in `_build_filter_request()` / `_fetch_mrps_parallel()` in `spiders/snapon_rest.py` (commented out).
+2. `amg: <userId>` header (= the user's userId — readily available from `/auth/account`).
+3. `sbsepc5s` + `sbsepc5cs` JWT headers (already captured at login).
+
+**Why it's currently disabled**: even with all of the above correctly set in httpx, the endpoint returns **400 Bad Request**. The same URL+headers via the live Playwright SPA session returns **200 with prices**. This suggests one of:
+- TLS/JA3 fingerprint check on `/picklist/*` endpoints (httpx + h11 ≠ browser TLS)
+- Server-side session state that requires the user to have visited the section page via the SPA (not just GET /pages/parts/)
+- Anti-replay protection on the picklist endpoint specifically
+
+**Next-pass plan (when we resume)**:
+- Capture FULL response headers + cookies of a successful SPA validatePart and a failing httpx validatePart, byte-diff.
+- Try via Playwright's `page.context.request.get()` (browser TLS, browser headers, browser cookies). This adds Playwright session lifetime cost but eliminates fingerprint variables.
+- If still 400, look for an explicit "add to picklist" POST in the SPA that we haven't isolated yet.
+
+**Artifacts**: `state/probe_snapon_picklist_mrp.py`, `state/probe_mrp_fresh_ids.py`, `state/probe_mrp_exact_headers.py`, `state/validatepart_headers.json`, `state/snapon_picklist_xhrs.jsonl`. The catalog-id tracking + parallel-fetch helpers are committed in the spider (commented out) so a re-enable is a 5-line uncomment once the fingerprint piece is cracked.
+
+For now: rows ship as `crawl_status=partial` (item_code + item_name + compatibility populated; MRP blank).
 
 ---
 
