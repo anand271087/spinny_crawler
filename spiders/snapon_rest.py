@@ -48,15 +48,25 @@ without `mrp` populated (crawl_status=partial). What we learned:
     — the numeric ID of the parent "Catalog" level node from the navigation
     tree (e.g. 7649 = IHMIP0Y24 - VERNA 24).
   - It also requires the `amg: <userId>` header.
-  - HOWEVER: even with the right URL, equipmentRefId, amg header, and JWT
-    tokens, httpx GETs return 400. The SAME endpoint returns 200 when called
-    from inside the live Playwright session (via SPA click). Likely cause is
-    server-side TLS/fingerprint or session-state check we haven't isolated.
-  - Probe artifacts at state/probe_mrp_*.py, state/snapon_picklist_xhrs.jsonl,
-    state/validatepart_headers.json. The catalog-id tracking + parallel-fetch
-    plumbing is still in the spider (commented as inactive) so the next
-    person can wire MRP fetch quickly once the fingerprint/session piece is
-    cracked. See per_site_notes §V2.2 for the open question.
+  - Two blockers found (2026-06-03 deep dive):
+    a) TLS fingerprint check — httpx → 400 always. Browser-channel fetch (via
+       Playwright page.evaluate or ctx.request) with the same URL + headers
+       returns 200. Solved by routing picklist calls through the browser.
+    b) SPA session-state precondition — even via the browser, validatePart
+       returns 400 unless the SPA UI has been clicked into that exact section
+       (year→model→catalog→group→section). Warming via GET /pages/parts/ does
+       NOT help. The SPA registers section-view state via internal JS that we
+       could not isolate or replicate outside its click flow.
+  - To unlock MRP in a future pass: either (a) drive Playwright UI clicks
+    per leaf section before calling validatePart (slow — ~5s/leaf × 387
+    leaves/model ≈ 30 min/model just for nav — but functionally works), or
+    (b) reverse-engineer the SPA's Angular PicklistService to call its
+    internal addPart() method via page.evaluate().
+  - Plumbing stays in this module (commented out): _fetch_mrps_via_browser,
+    _register_parts_for_picklist, _build_filter_request, and DFS catalog_id
+    tracking. Re-enable is a 5-line uncomment once the SPA-session piece is
+    solved. See per_site_notes §V2.2 for the operator-level summary and a
+    full list of probe artifacts.
 """
 from __future__ import annotations
 
@@ -99,8 +109,17 @@ def _resolve_creds(brand_key: str) -> tuple[str, str]:
     raise RuntimeError(f"no credentials for brand={brand_key}")
 
 
-def _playwright_login(brand_key: str, user: str, password: str) -> tuple[dict, dict]:
-    """Returns (auth_headers_dict, cookies_dict). Opens + closes Playwright in <30s."""
+def _playwright_login(brand_key: str, user: str, password: str):
+    """Logs in to SNAP-ON. Returns (playwright_ctx_manager, browser, context, page,
+    auth_headers_dict, cookies_dict).
+
+    The browser is kept OPEN for the MRP fetch path. Caller is responsible for
+    calling `pw_cm.__exit__()` (or using as a context manager) to clean up.
+
+    auth_headers contains: sbsepc5s, sbsepc5cs, x-client-version — captured
+    from the first /auth/account XHR the SPA fires post-login. cookies is the
+    BrowserContext cookies (used by ctx.request automatically).
+    """
     captured: dict = {}
 
     def on_request(req):
@@ -108,43 +127,47 @@ def _playwright_login(brand_key: str, user: str, password: str) -> tuple[dict, d
         if not captured and req.url.endswith("/epc-services/auth/account"):
             captured.update({k.lower(): v for k, v in req.headers.items()})
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        )
-        ctx = browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-            ),
-        )
-        ctx.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
-        page = ctx.new_page()
-        page.on("request", on_request)
+    # NOTE: we explicitly do NOT use a `with sync_playwright()` block here so
+    # the browser stays alive after this function returns. Caller calls
+    # pw_cm.__exit__() to clean up.
+    pw_cm = sync_playwright()
+    p = pw_cm.__enter__()
+    browser = p.chromium.launch(
+        headless=True,
+        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+    )
+    ctx = browser.new_context(
+        viewport={"width": 1920, "height": 1080},
+        user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+    )
+    ctx.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+    )
+    page = ctx.new_page()
+    page.on("request", on_request)
 
-        log.info("%s: playwright login start", brand_key)
-        page.goto(f"{BASE}/epc/", wait_until="domcontentloaded", timeout=LOGIN_TIMEOUT_MS)
-        # Sometimes SNAP-ON's bundle takes ~7-10s to render the form
-        page.wait_for_selector("input[type=text]", state="visible", timeout=20_000)
-        page.wait_for_timeout(1500)
-        page.locator("input[type=text]").first.fill(user)
-        page.locator("input[type=password]").first.fill(password)
-        page.locator("button:has-text('Login')").first.click()
-        page.wait_for_timeout(POST_LOGIN_WAIT_MS)
+    log.info("%s: playwright login start", brand_key)
+    page.goto(f"{BASE}/epc/", wait_until="domcontentloaded", timeout=LOGIN_TIMEOUT_MS)
+    # Sometimes SNAP-ON's bundle takes ~7-10s to render the form
+    page.wait_for_selector("input[type=text]", state="visible", timeout=20_000)
+    page.wait_for_timeout(1500)
+    page.locator("input[type=text]").first.fill(user)
+    page.locator("input[type=password]").first.fill(password)
+    page.locator("button:has-text('Login')").first.click()
+    page.wait_for_timeout(POST_LOGIN_WAIT_MS)
 
-        body = page.locator("body").inner_text()
-        if "Logout" not in body:
-            browser.close()
-            raise RuntimeError(f"{brand_key}: login failed (no Logout link)")
-
-        # Give the SPA a moment to fire /auth/account so we capture headers
-        page.wait_for_timeout(ACCOUNT_WAIT_MS)
-        cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+    body = page.locator("body").inner_text()
+    if "Logout" not in body:
         browser.close()
+        pw_cm.__exit__(None, None, None)
+        raise RuntimeError(f"{brand_key}: login failed (no Logout link)")
+
+    # Give the SPA a moment to fire /auth/account so we capture headers
+    page.wait_for_timeout(ACCOUNT_WAIT_MS)
+    cookies = {c["name"]: c["value"] for c in ctx.cookies()}
 
     auth_headers = {
         k: captured[k]
@@ -152,12 +175,14 @@ def _playwright_login(brand_key: str, user: str, password: str) -> tuple[dict, d
         if k in captured
     }
     if "sbsepc5s" not in auth_headers or "sbsepc5cs" not in auth_headers:
+        browser.close()
+        pw_cm.__exit__(None, None, None)
         raise RuntimeError(
             f"{brand_key}: failed to capture session tokens "
             f"(captured keys: {list(captured.keys())[:10]})"
         )
     log.info("%s: tokens captured (sbsepc5s, sbsepc5cs, x-client-version)", brand_key)
-    return auth_headers, cookies
+    return pw_cm, browser, ctx, page, auth_headers, cookies
 
 
 class Spider(BaseSpider):
@@ -181,10 +206,17 @@ class Spider(BaseSpider):
         user, password = _resolve_creds(self.brand_key)
         log.info("%s: credentials resolved user=%r", self.brand_key, user)
 
-        # 1. Login + extract tokens
-        auth_headers, cookies = _playwright_login(self.brand_key, user, password)
+        # 1. Login — keep Playwright alive: MRP /picklist/validatePart calls
+        # require browser TLS fingerprint (httpx 400s on those even with
+        # identical headers — see module docstring "MRP STATUS").
+        pw_cm, browser, pw_ctx, pw_page, auth_headers, cookies = _playwright_login(
+            self.brand_key, user, password
+        )
+        # Stash for the helpers
+        self._pw_ctx = pw_ctx
+        self._auth_headers = auth_headers
 
-        # 2. httpx session for all data calls
+        # 2. httpx session for /navigations and /pages/parts (fast — no fingerprint check)
         headers = {
             "user-agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -194,10 +226,21 @@ class Spider(BaseSpider):
             "accept": "application/json, text/plain, */*",
             **auth_headers,
         }
-        with httpx.Client(
-            headers=headers, cookies=cookies, timeout=45, follow_redirects=True
-        ) as client:
-            return self._crawl_via_rest(client, t_start)
+        try:
+            with httpx.Client(
+                headers=headers, cookies=cookies, timeout=45, follow_redirects=True
+            ) as client:
+                return self._crawl_via_rest(client, t_start)
+        finally:
+            # Always clean up Playwright (even on exception)
+            try:
+                browser.close()
+            except Exception:
+                pass
+            try:
+                pw_cm.__exit__(None, None, None)
+            except Exception:
+                pass
 
     def _crawl_via_rest(self, client: httpx.Client, t_start: float) -> list[Row]:
         # 3. Get account info (userId)
@@ -316,20 +359,11 @@ class Spider(BaseSpider):
                             seen_part_ids.add(pid)
                         new_parts.append(p)
 
-                    # MRP fetch is DISABLED — endpoint returns 400 outside the
-                    # live SPA session (see module docstring "MRP STATUS"). The
-                    # plumbing below remains as a launch-point for the next pass.
+                    # MRP fetch is DISABLED — see module docstring "MRP STATUS"
+                    # for the full investigation. TL;DR: validatePart needs SPA
+                    # UI-click session state we couldn't replicate outside the
+                    # browser-driven click flow. Rows ship as `partial` for now.
                     mrp_map: dict[str, Optional[float]] = {}
-                    # Re-enable when the SPA-session check is cracked:
-                    # if new_parts and new_catalog_id:
-                    #     fr_leaf = self._build_filter_request(
-                    #         ds_id, price_book_id, user_id, new_catalog_id)
-                    #     self._register_parts_for_picklist(
-                    #         client, ds_id, node_sp, fr_leaf, new_parts)
-                    #     mrp_map = self._fetch_mrps_parallel(
-                    #         client, ds_id, fr_leaf, new_parts)
-                    #     mrp_lookups += len(new_parts)
-                    #     mrp_hits += sum(1 for v in mrp_map.values() if v is not None)
 
                     for p in new_parts:
                         pid = p.get("partId", "")
@@ -378,6 +412,131 @@ class Spider(BaseSpider):
             f"priceBookId={price_book_id}|userId={user_id}"
         )
         return _b64(raw)
+
+    def _fetch_mrps_via_browser(
+        self,
+        ds_id: str,
+        fr_leaf: str,
+        parts: list[dict],
+        user_id: str,
+        leaf_sp: str = "",
+        batch_size: int = 50,
+    ) -> dict[str, Optional[float]]:
+        """For each part, call /picklist/validatePart via Playwright (browser
+        TLS) and extract MOB_MRP_A. Returns {partId: mrp_or_None}.
+
+        Why via browser: SNAP-ON's WAF JA3-checks /picklist/* endpoints. httpx
+        (Python TLS) returns 400; the SAME URL + headers from inside the
+        browser returns 200.
+
+        Implementation: page.evaluate() with Promise.all() — single JS round-
+        trip, browser fires up to ~6 concurrent HTTP/2 streams natively. Way
+        faster than serial ctx.request, and sync Playwright isn't thread-safe
+        so a Python ThreadPool wouldn't work anyway.
+
+        Batched at 50 parts per evaluate to keep the JSON arg/result manageable
+        and to bound the per-call wall-clock (each batch is ~5-8 seconds).
+        """
+        result: dict[str, Optional[float]] = {}
+        if not parts:
+            return result
+
+        # MUST match the SPA's full header set — including sec-ch-ua client hints
+        # and user-agent — captured from the live add-to-picklist click. Without
+        # the full set, the WAF returns 400 (verified 2026-06-03).
+        req_headers = {
+            "accept": "application/json, text/plain, */*",
+            "amg": user_id,
+            "cache-control": "no-cache,no-store",
+            "expires": "0",
+            "pragma": "no-cache",
+            "referer": f"{BASE}/epc/",
+            "sec-ch-ua": '"HeadlessChrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "sec-ch-ua-platform-version": '"10.15.7"',
+            "user-agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "HeadlessChrome/147.0.0.0 Safari/537.36"
+            ),
+            **self._auth_headers,
+        }
+
+        js = """async ({pairs, headers, warmUrl}) => {
+            // Warm the session: browser GET the section's parts page so the
+            // SPA's server-side state knows we're "viewing" this leaf. Without
+            // this warm, validatePart returns 400 even with all correct headers.
+            const out = {};
+            const debug = {firstStatus: null, firstBody: null, errors: 0, warmStatus: null};
+            try {
+                const warmResp = await fetch(warmUrl, {credentials: 'include', headers});
+                debug.warmStatus = warmResp.status;
+            } catch (e) {
+                debug.warmStatus = 'err: ' + e.message;
+            }
+            const results = await Promise.all(pairs.map(async ([url, pid], i) => {
+                try {
+                    const r = await fetch(url, {credentials: 'include', headers});
+                    if (i === 0) {
+                        debug.firstStatus = r.status;
+                        debug.firstBody = (await r.clone().text()).slice(0, 400);
+                    }
+                    if (!r.ok) return [pid, null];
+                    const data = await r.json();
+                    const prices = data.prices || [];
+                    const mrp = prices.find(p => p.priceType === 'MOB_MRP_A');
+                    return [pid, mrp ? mrp.amount : null];
+                } catch (e) {
+                    debug.errors++;
+                    return [pid, null];
+                }
+            }));
+            for (const [pid, amt] of results) out[pid] = amt;
+            return {out, debug};
+        }"""
+
+        # Process in batches to avoid huge single page.evaluate args.
+        for start in range(0, len(parts), batch_size):
+            chunk = parts[start : start + batch_size]
+            pairs = []
+            for p in chunk:
+                pid = p.get("partId", "")
+                piid = p.get("partItemId", "")
+                if not pid or not piid:
+                    continue
+                url = (
+                    f"{BASE}/epc-services/picklist/validatePart/datasetId/{ds_id}/"
+                    f"filterRequest/{fr_leaf}/partId/{pid}/partItemId/{piid}"
+                )
+                pairs.append([url, pid])
+            if not pairs:
+                continue
+            warm_url = (
+                f"{BASE}/epc-services/datasets/{ds_id}/pages/parts/{leaf_sp}/"
+                f"filterRequest/{fr_leaf}"
+                if leaf_sp else ""
+            )
+            try:
+                page = self._pw_ctx.pages[0]  # the login page is still alive
+                batch_result = page.evaluate(js, {
+                    "pairs": pairs, "headers": req_headers, "warmUrl": warm_url,
+                })
+            except Exception as e:
+                log.warning("validatePart batch err: %s", e)
+                continue
+            if start == 0:  # log debug from first batch only
+                debug = (batch_result or {}).get("debug", {})
+                log.info("MRP first-batch debug: warm=%s status=%s firstBody=%r errors=%s",
+                         debug.get("warmStatus"),
+                         debug.get("firstStatus"), (debug.get("firstBody") or "")[:200],
+                         debug.get("errors"))
+            for pid, amt in (batch_result or {}).get("out", {}).items():
+                try:
+                    result[pid] = float(amt) if amt is not None else None
+                except (TypeError, ValueError):
+                    result[pid] = None
+        return result
 
     def _register_parts_for_picklist(
         self,

@@ -1099,37 +1099,60 @@ The `{sp}` parameter is a base64-encoded `serializedPath` cursor returned in the
 - Always extract `sbsepc5s` + `sbsepc5cs` from the FIRST `/auth/account` request headers. Don't try to derive `sbsepc5cs` from the JWT — the SPA's JS does that, we don't need to.
 - Use `httpx.Client` (not AsyncClient) for SNAP-ON — endpoints are fast and serial walking respects pagination; async doesn't help.
 
-**Pending — MRP via picklist API (2026-06-03 partial investigation)**:
+**Pending — MRP via picklist API (2026-06-03 full investigation)**:
 
-We attempted to wire MRP fetch via `GET /epc-services/picklist/validatePart/datasetId/<ds>/filterRequest/<fr>/partId/<pid>/partItemId/<piid>`. The endpoint exists and returns:
+Reverse-engineered the picklist API, identified TWO blockers, neither solved in this pass. Rows continue to ship `partial` (item_code + item_name + compatibility populated; mrp blank).
+
+**The endpoint**: `GET /epc-services/picklist/validatePart/datasetId/<ds>/filterRequest/<fr>/partId/<pid>/partItemId/<piid>` returns `prices[]` like:
 ```json
-"prices": [
+[
   {"priceType":"MOB_LIST","amount":"863.14","currency":"INR"},
   {"priceType":"MOB_MRP_A","amount":"1079.00","currency":"INR"},
   {"priceType":"MSRP","amount":"1079.00","currency":"INR"},
   ...
 ]
 ```
-when called from inside the live SPA session (Playwright). The desired field is `MOB_MRP_A` (Hyundai dealer-zone A).
+We want `MOB_MRP_A` (Hyundai dealer-zone A MRP).
 
-**What's required**:
-1. `equipmentRefId=<catalog_id>` baked into the filterRequest (numeric id of the parent "Catalog" level navigation node — e.g. 7649 for IHMIP0Y24 VERNA 24). The spider's DFS now tracks this, plumbing in `_build_filter_request()` / `_fetch_mrps_parallel()` in `spiders/snapon_rest.py` (commented out).
-2. `amg: <userId>` header (= the user's userId — readily available from `/auth/account`).
-3. `sbsepc5s` + `sbsepc5cs` JWT headers (already captured at login).
+**Required inputs (all identified)**:
+1. `equipmentRefId=<catalog_id>` baked into the filterRequest base64 (numeric id of the parent "Catalog" navigation node — e.g. 7649 = IHMIP0Y24 VERNA 24). Spider tracks this via DFS now.
+2. `amg: <userId>` header.
+3. `sbsepc5s` + `sbsepc5cs` JWT headers (auto-captured at login).
+4. Full Chrome `sec-ch-ua-*` + `user-agent` headers.
 
-**Why it's currently disabled**: even with all of the above correctly set in httpx, the endpoint returns **400 Bad Request**. The same URL+headers via the live Playwright SPA session returns **200 with prices**. This suggests one of:
-- TLS/JA3 fingerprint check on `/picklist/*` endpoints (httpx + h11 ≠ browser TLS)
-- Server-side session state that requires the user to have visited the section page via the SPA (not just GET /pages/parts/)
-- Anti-replay protection on the picklist endpoint specifically
+**Two blockers found**:
 
-**Next-pass plan (when we resume)**:
-- Capture FULL response headers + cookies of a successful SPA validatePart and a failing httpx validatePart, byte-diff.
-- Try via Playwright's `page.context.request.get()` (browser TLS, browser headers, browser cookies). This adds Playwright session lifetime cost but eliminates fingerprint variables.
-- If still 400, look for an explicit "add to picklist" POST in the SPA that we haven't isolated yet.
+**Blocker 1 (solved): TLS fingerprint check.** httpx (Python TLS, h11) → always 400. The SAME URL + headers from inside Chromium → 200. SNAP-ON's WAF JA3-fingerprints `/picklist/*` endpoints specifically. Other endpoints (navigations, pages/parts) don't have this check — httpx works fine there.
+- Solved by routing picklist calls through the browser: `page.evaluate(fetch(...))` or `ctx.request.get(...)`.
 
-**Artifacts**: `state/probe_snapon_picklist_mrp.py`, `state/probe_mrp_fresh_ids.py`, `state/probe_mrp_exact_headers.py`, `state/validatepart_headers.json`, `state/snapon_picklist_xhrs.jsonl`. The catalog-id tracking + parallel-fetch helpers are committed in the spider (commented out) so a re-enable is a 5-line uncomment once the fingerprint piece is cracked.
+**Blocker 2 (NOT solved): SPA session-state precondition.** Even from inside the browser with the correct URL + headers + cookies, validatePart returns 400 **unless the SPA UI has clicked into that exact section first**. The SPA registers its "currently viewing section X" state via some Angular internal mechanism we couldn't isolate.
+- Tried: pre-warming with `GET /pages/parts/<sp>` via browser → no effect.
+- Tried: pre-warming with `POST /pages/parts/<sp>/userContentIndicators` → no effect.
+- Tried: `page.goto('#/parts;serializedPath=...')` for hash-routing → the SPA's URL stays at `#/` regardless of section navigated to. Internal state only.
+- Both ctx.request and page.evaluate(fetch) hit blocker 2 the same way.
 
-For now: rows ship as `crawl_status=partial` (item_code + item_name + compatibility populated; MRP blank).
+**To unlock MRP in a future pass — three options**:
+
+| Option | Effort | Trade-off |
+|---|---|---|
+| **A. UI-click each leaf via Playwright before MRP fetch** | ~2 days | Slow: ~5s/leaf × 387 leaves/model × 5 models = ~3-5h per Hyundai run. Same as legacy spider but more reliable post-2026-05-30. |
+| **B. Reverse-engineer the SPA's Angular PicklistService** | ~1 week | `page.evaluate(angular.get('PicklistService').addPart(...))` — calls the SPA's own picklist add function which handles internal state. Risky: requires finding the Angular DI token name; brittle to SPA updates. |
+| **C. SNAP-ON B2B data feed** | Commercial conversation | Cleanest: get a direct price feed from SNAP-ON / Hyundai dealer relations. Bypasses entire client-side reverse engineering. |
+
+**Spider plumbing kept** for the future re-enable (5-line uncomment in the leaf loop once Blocker 2 is solved):
+- `_fetch_mrps_via_browser()` — `page.evaluate(Promise.all(fetch()))` batching
+- `_register_parts_for_picklist()` — POST /userContentIndicators
+- `_build_filter_request()` — filterRequest with equipmentRefId
+- DFS catalog_id tracking on the walk stack
+
+**Probe artifacts** (under `state/`):
+- `probe_snapon_picklist_mrp.py` — original endpoint discovery
+- `probe_validatepart_headers.py` — captured the 14 SPA request headers
+- `probe_mrp_browser_with_headers.py` — proved browser-channel fetch works
+- `probe_ctx_request_validate.py` — proved ctx.request also works
+- `probe_section_url.py` — discovered SPA URL stays at `#/` regardless of navigation
+- `probe_mrp_browser_fetch.py`, `probe_mrp_fresh_ids.py`, `probe_mrp_exact_headers.py` — various blocker-2 attempts
+- `validatepart_headers.json`, `snapon_picklist_xhrs.jsonl` — raw captures
 
 ---
 
