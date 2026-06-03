@@ -1131,13 +1131,39 @@ We want `MOB_MRP_A` (Hyundai dealer-zone A MRP).
 - Tried: `page.goto('#/parts;serializedPath=...')` for hash-routing → the SPA's URL stays at `#/` regardless of section navigated to. Internal state only.
 - Both ctx.request and page.evaluate(fetch) hit blocker 2 the same way.
 
-**To unlock MRP in a future pass — three options**:
+**The right endpoint is actually `/partdetails/supersession`, not `/picklist/validatePart`** (2026-06-03 follow-on probe — `state/probe_part_detail.py`). When the user clicks a part number, the SPA fires:
+```
+GET /epc-services/partdetails/supersession?ds=<ds>&pr=<partId>&fr=<filterRequest>
+```
+The response contains a `prices[]` array including `MOB_MRP_A`. Confirmed real:
+- JACK ASSY (`09110-H6500`, partId 378794) → MOB_MRP_A = **1,079.00 INR**
+- LABEL (`09127-2C001`) → 25.00
+- WRENCH-WHEEL NUT (`09131-3B010`) → 369.00
+- ...
+
+**Same TLS-fingerprint check as picklist endpoints**: httpx → 400, browser fetch → 200.
+
+**Same SPA-session precondition**: returns 400 unless the SPA has fired supersession for ≥1 part in the section already (via a part-number UI click). Tested progressive UI drills — Year → Model → Catalog → Group → Section all return 400. Only a **part-number click** sets the state. Once set, the **same state covers ALL parts in that section** — verified by fetching supersession for 5 different partIds after clicking only 1, all returned 200 with correct prices.
+
+**Realistic cost analysis (per Hyundai run)**:
+| Step | Cost |
+|---|---|
+| UI drill to section (5 clicks) | ~5s |
+| Click first part-number (kicks off supersession) | ~3s |
+| Parallel browser-fetch supersession for all ~50 parts in section | ~5s |
+| **Per section** | **~13s** |
+| × ~387 sections per model | **~84 min/model** |
+| × 5 models in year=2026 | **~7 hours per Hyundai run** |
+
+This exceeds the BRD §8 8h SLA when combined with other brands' runs. **MRP cannot be a single monthly run.**
+
+**Realistic options**:
 
 | Option | Effort | Trade-off |
 |---|---|---|
-| **A. UI-click each leaf via Playwright before MRP fetch** | ~2 days | Slow: ~5s/leaf × 387 leaves/model × 5 models = ~3-5h per Hyundai run. Same as legacy spider but more reliable post-2026-05-30. |
-| **B. Reverse-engineer the SPA's Angular PicklistService** | ~1 week | `page.evaluate(angular.get('PicklistService').addPart(...))` — calls the SPA's own picklist add function which handles internal state. Risky: requires finding the Angular DI token name; brittle to SPA updates. |
-| **C. SNAP-ON B2B data feed** | Commercial conversation | Cleanest: get a direct price feed from SNAP-ON / Hyundai dealer relations. Bypasses entire client-side reverse engineering. |
+| **A. Quarterly MRP-enrichment pass** (recommended) | ~1 day | Separate script (`state/enrich_hyundai_mrp.py`) runs once a quarter, walks the catalog with UI clicks, updates the `mrp` column on existing rows. Monthly catalog run stays fast (12 min). Prices change rarely, so quarterly cadence matches business need. |
+| **B. SNAP-ON B2B data feed** (commercial) | Spinny ↔ SNAP-ON conversation | Cleanest: native price feed bypasses all client-side reverse engineering. |
+| **C. Reverse-engineer SPA Angular services** | ~1 week | Find `PartDetailsService.fetch()` (or equivalent) and call via `page.evaluate(angular.get(...))`. Bypasses the UI click. Brittle to SPA updates. |
 
 **Spider plumbing kept** for the future re-enable (5-line uncomment in the leaf loop once Blocker 2 is solved):
 - `_fetch_mrps_via_browser()` — `page.evaluate(Promise.all(fetch()))` batching
