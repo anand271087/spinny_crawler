@@ -1221,6 +1221,7 @@ This exceeds the BRD §8 8h SLA when combined with other brands' runs. **MRP can
 - Capture `sbsepc5s`+`sbsepc5cs` from the first `/auth/account` request headers; replay via httpx
 
 **Additional fields added 2026-06-13 (Spinny scope extension — Toyota only)**:
+- Production-verified full run 2026-06-13: **26,820 parts in 12.8 min**, `description` + `start_date` populated across all rows, `end_date` filled on superseded parts. Crawl time unchanged vs pre-extension.
 - `description` ← `partItems[].description` (same source as `item_name`; emitted as its own column per stakeholder ask)
 - `start_date` ← dynamicColumns `code=FDATE` (part validity start, e.g. "2022-11")
 - `end_date` ← dynamicColumns `code=TDATE` (part validity end; blank for in-production parts)
@@ -1275,30 +1276,36 @@ This exceeds the BRD §8 8h SLA when combined with other brands' runs. **MRP can
 
 ---
 
-### V2.4 Mahindra — 🔧 PART-LEVEL drill added 2026-06-13 (Spinny scope extension)
+### V2.4 Mahindra — ✅ PART-LEVEL drill SHIPPED 2026-06-13 (Spinny scope extension)
+
+**Production result (full run, 2026-06-13)**: **28,222 parts in 6.0 h**, `crawl_status=success`, all 20 PV categories. New fields 100% populated: `description`, `part_structure`, `start_date` (28,222/28,222 each). 14 hard-resets across the run, **0 aborts**. Output: `output/<date>/mahindra_<date>.csv`.
 
 **What changed**: previously the spider stopped at the **assembly** level (one row per assembly: `item_name=categoryname`, `item_code=figno`). Spinny asked for **part-level** data — Description, Start Date, End Date per part. Those fields do NOT exist on the assembly response; they live one drill deeper, in the per-assembly parts table.
 
 **Mechanism** (`spiders/mahindra.py::_drill_assemblies`):
 1. At each section's assembly grid, click an assembly thumbnail by name.
-2. The click fires a native **"search parts with prod date 13/Jun/2026"** confirm — auto-accepted via `page.on("dialog", lambda d: d.accept())` plus a best-effort in-page Yes/OK click (`_accept_confirm`) for the Angular-modal variant.
+2. The click fires a native **"search parts with prod date <today>"** confirm — auto-accepted via `page.on("dialog", lambda d: d.accept())` plus a best-effort in-page Yes/OK click (`_accept_confirm`) for the Angular-modal variant.
 3. The SPA then fires `POST /webapi/api/Illustration/GetIllustrationPartsJQ` → returns the parts list. Captured via `page.on("response")` (broadened from `/FigureSearch/` to `/webapi/api/`).
-4. **Clicking an assembly SWITCHES the view to parts-detail (the grid is hidden).** So between assemblies we click the section breadcrumb (`sp_name`) to re-render the grid, then click the next assembly. Verified reliable across 6 assemblies (distinct fignos, ~7s/assembly).
+4. **Clicking an assembly SWITCHES the view to parts-detail (the grid is hidden).** So between assemblies we click the section breadcrumb (`sp_name`) to re-render the grid, then click the next assembly. ~7s/assembly, verified stable across the full ~1,400-assembly run.
 
 **Field map (part grain)**:
 - `item_code` ← `partNo` (real part number, replaces figno)
 - `item_name` / `description` ← part `description`
 - `start_date` ← `startDate` (ISO → date, e.g. "2025-06-01")
-- `end_date` ← `endDate` (null for in-production parts → left blank, NOT required → no `partial`)
+- `end_date` ← `endDate` (null for in-production parts → left blank, NOT required → no `partial`). NOTE: every part in the 2026-06-13 run was in-production, so `end_date` was entirely empty and `lib/output.py` dropped the column from the per-brand CSV by design; it stays in the master schema and fills for superseded parts.
 - `part_structure` ← full breadcrumb `cat > variant > section > assembly_name (figno)` — satisfies "Complete Part Structure"
 - `compatible_car_model` ← `cat | variant`
 
-**Payload is encrypted** (`FigureSearchParm` AES blob), same as the whole Intelli Catalogue drill — confirmed we cannot replay/swap IDs to skip the UI. Every assembly requires a real UI click. This is the cost driver below.
+**Payload is encrypted** (`FigureSearchParm` AES blob), same as the whole Intelli Catalogue drill — confirmed we cannot replay/swap IDs to skip the UI. Every assembly requires a real UI click.
 
-**⚠ VOLUME / RUNTIME** (the scope reality flagged to Spinny):
-- Assembly-grain default was ~24,800 rows in ~5h. Part-grain adds a click+dialog+parse+back-nav (~7s) **per assembly** (~40 assemblies/section).
-- Full representative scope (20 cats × 1 variant × 31 sections × ~40 assemblies) ≈ tens of hours — **exceeds the 8h BRD §8 window**. Run with reduced scope or split runs.
-- New knobs: `MAHINDRA_PART_LEVEL` (default 1; set 0 for old assembly grain), `MAHINDRA_MAX_ASSEMBLIES` (default 0=all — the main runtime lever). Existing `MAHINDRA_MAX_CATEGORIES/VARIANTS/SP_CATEGORIES` still apply.
+**Re-nav resilience — the key lesson from the full run** (`_renavigate_to_pv_root` + hard-reset in `crawl`):
+- Deep part-drilling **corrupts the SPA session**: after a section's worth of assembly clicks, a plain `page.goto(FIGURE_URL)` + click "Passenger Vehicles" fails to re-render the PV tile on **~15 of 19** category transitions. This is NOT load-related — it persisted after MG finished and Mahindra ran solo.
+- The first full run (before the fix) **aborted at category 2/20**. Fix = **single quick re-nav attempt → fresh-login hard-reset fallback** (`open_session()` drops the BrowserContext and logs in again, ~45s). The retry catches the occasional light transition (BOLERO, LOGAN-VERITO recovered on it); everything else hard-resets and continues. This carried all 20 categories with 0 data loss.
+- Earlier the re-nav used 3 retries; cut to 1 on 2026-06-13 since retries reliably fail post-drill and just burned ~30s/transition.
+
+**VOLUME / RUNTIME**:
+- Part-grain default ≈ **28k rows / ~6 h** at representative scope (20 cats × 1 variant × all sections × all assemblies). Fits a dedicated overnight slot; would breach the 8h BRD §8 window only if combined with other brands the same night.
+- Knobs: `MAHINDRA_PART_LEVEL` (default 1; set 0 for old assembly grain), `MAHINDRA_MAX_ASSEMBLIES` (default 0=all — the main runtime lever), plus existing `MAHINDRA_MAX_CATEGORIES/VARIANTS/SP_CATEGORIES`.
 - Smoke (1 cat × 1 var × 1 sp × 2 asm): 11 parts, status=success, ~78s incl. login.
 
 ---
@@ -1385,13 +1392,15 @@ The default was bumped from `1/1/1` → `0/1/0` on 2026-05-19 after the drill ch
 
 ### V2.5 MG — 🔧 PART-LEVEL drill added 2026-06-13 (Spinny scope extension)
 
+**Production result (full run, 2026-06-13)**: **10,281 parts in 99 min** (1.65 h), `crawl_status=success`, all 7 models. (Ran concurrently with the Mahindra full run for ~half its duration, so solo it's faster.) Output: `output/<date>/mg_<date>.csv`.
+
 Same change as Mahindra §V2.4 — MG runs the identical Intelli Catalogue v11.0 platform and the same `GetIllustrationPartsJQ` part-table endpoint. `spiders/mg.py::_drill_assemblies` mirrors Mahindra's, hooked into MG's **adaptive recursion** (the part-drill replaces the assembly-row emission inside the `if any(figno)` block).
 - Back-nav between assemblies clicks the **section breadcrumb = `path[-1]`** (the entry that produced the assemblies), then clicks the next assembly.
 - `part_structure` ← `MG > model > variant > sub-variant > section > assembly_name (figno)`.
 - Field map + date handling + bonus-date rationale identical to Mahindra.
+- **MG did NOT need the hard-reset**: its existing between-model reset (`FIGURE SEARCH` click + full `page.goto`) auto-reloads the model list and survives the deep part-drill, unlike Mahindra's PV-tile re-nav. So MG ran clean end-to-end with no fresh-login resets.
 - Knobs: `MG_PART_LEVEL` (default 1), `MG_MAX_ASSEMBLIES` (default 0=all). Existing `MG_MAX_MODELS/VARIANTS/SP_CATEGORIES/MAX_DEPTH` still apply.
 - Smoke (1 model × 1 var × 1 section × 3 asm = MG Hector ENGINE): 59 parts, distinct fignos (BJ00-001/002/003), status=success, ~2 min incl. login.
-- Same **⚠ volume/runtime** caveat as Mahindra: part-grain × ~40 assemblies/section blows past the 8h window at full scope. Cap via `MG_MAX_ASSEMBLIES` or split runs.
 
 ---
 
