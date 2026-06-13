@@ -21,7 +21,11 @@ class Row:
     item_name: str | None = None
     item_code: str | None = None
     mrp: float | None = None
+    description: str | None = None
     compatible_car_model: str | None = None
+    part_structure: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
     tyre_sizes: str | None = None
     vehicle_compatibility: str | None = None
     source_website: str = ""

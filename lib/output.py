@@ -20,7 +20,7 @@ from pathlib import Path
 import pandas as pd
 
 ALWAYS_KEEP = ["brand", "source_website", "crawl_date", "crawl_status"]
-PRODUCT_FIELDS = ["item_name", "item_code", "mrp", "compatible_car_model", "tyre_sizes", "vehicle_compatibility"]
+PRODUCT_FIELDS = ["item_name", "item_code", "mrp", "description", "compatible_car_model", "part_structure", "start_date", "end_date", "tyre_sizes", "vehicle_compatibility"]
 
 
 def _to_df(rows: list[dict]) -> pd.DataFrame:

@@ -161,26 +161,33 @@ brands:
   toyota:
     url: https://snaponepc.com/epc/
     pattern: snapon_epc  # same platform as Hyundai
-    fields: [item_name, item_code, mrp, compatible_car_model]
+    fields: [item_name, item_code, mrp, compatible_car_model, description]
+    # start_date/end_date populated as bonus (FDate/TDate dynamicColumns) but NOT
+    # required — TDate legitimately blank for in-production parts, must not flag partial.
     auth: env_vars  # TOYOTA_USER, TOYOTA_PASS — see .env.example
     priority: 4
-    notes: "Catalog OK; MRP empty server-side (TKM_TOY price book unpopulated for current dealer). See docs/per_site_notes.md §V2.3"
+    notes: "Catalog OK; MRP empty server-side (TKM_TOY price book unpopulated for current dealer). description + start_date(FDate) + end_date(TDate) added 2026-06-13 from existing /pages/parts payload (no extra calls). See docs/per_site_notes.md §V2.3"
 
   mahindra:
     url: https://mahindra-ecat.com/epcview/login
     pattern: cascading_dropdown  # Intelli Catalogue tree (CategoryType → Category → Model → ...)
-    fields: [item_name, item_code, compatible_car_model]
+    fields: [item_name, item_code, compatible_car_model, description, part_structure]
+    # part-level grain (2026-06-13): item_code=partNo, item_name=part description.
+    # start_date/end_date populated as bonus (endDate legit-blank for in-production parts).
+    part_level: true  # MAHINDRA_PART_LEVEL=0 to fall back to assembly grain
     auth: env_vars  # MAHINDRA_USER, MAHINDRA_PASS — see .env.example
     priority: 3
-    notes: "BRD §7 captcha blocker solved via offline ddddocr OCR (free, no SaaS). Tree at /api/Quick/getFavTree exposes ~565 models across 4 CategoryTypes; spider filters to Passenger Vehicles per BRD. Parts-leaf drill TODO. See docs/per_site_notes.md §V2.4"
+    notes: "BRD §7 captcha blocker solved via offline ddddocr OCR. Part-level drill added 2026-06-13: click each assembly → accept prod-date dialog → GetIllustrationPartsJQ returns parts with partNo/description/startDate/endDate. Grain = per-part. SCOPE: part-drill multiplies leaves ~40× — see per_site_notes §V2.4 for volume math + scope knobs. See docs/per_site_notes.md §V2.4"
 
   mg:
     url: https://serviceconnect.mgmotorindia.com/epc/login
     pattern: cascading_dropdown  # Intelli Catalogue v11.0 (same as Mahindra); OCR-bypass captcha
-    fields: [item_name, item_code, compatible_car_model]
+    fields: [item_name, item_code, compatible_car_model, description, part_structure]
+    # part-level grain (2026-06-13): same GetIllustrationPartsJQ drill as Mahindra.
+    part_level: true  # MG_PART_LEVEL=0 to fall back to assembly grain
     auth: env_vars  # MG_USER, MG_PASS — see .env.example
     priority: 5
-    notes: "Identical Intelli Catalogue v11.0 platform as Mahindra. Captcha solved via offline ddddocr. No User Type dropdown (vs Mahindra). Tree via /api/Quick/getFavTree → Passenger Vehicles filter. Parts-leaf drill TODO. See docs/per_site_notes.md §V2.5"
+    notes: "Identical Intelli Catalogue v11.0 platform as Mahindra. Captcha via offline ddddocr. No User Type dropdown. Part-level drill added 2026-06-13 (same GetIllustrationPartsJQ as Mahindra). Grain = per-part. See docs/per_site_notes.md §V2.5"
 
   tata:
     url: https://www.tatamotorsecats.com/frmTATAModelSearch.aspx
@@ -206,3 +213,7 @@ field_map:
   "Compatible with which car model": compatible_car_model
   "Tyre Sizes available": tyre_sizes
   "Vehicle Information (Compatibility)": vehicle_compatibility
+  "Description": description
+  "Complete Part Structure": part_structure
+  "Start Date": start_date
+  "End Date": end_date

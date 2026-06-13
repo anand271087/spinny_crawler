@@ -99,6 +99,17 @@ def _b64(s: str) -> str:
     return base64.b64encode(s.encode("utf-8")).decode("ascii")
 
 
+def _dyn_col(part: dict, code: str) -> Optional[str]:
+    """Pull a dynamicColumns value by its `code` (e.g. FDATE/TDATE). SNAP-ON
+    returns part-validity dates here, not as top-level fields. Returns None when
+    the column is absent or blank (legitimate for in-production parts)."""
+    for col in (part.get("dynamicColumns") or []):
+        if isinstance(col, dict) and col.get("code") == code:
+            v = (col.get("value") or "").strip()
+            return v or None
+    return None
+
+
 def _resolve_creds(brand_key: str) -> tuple[str, str]:
     env_u = os.environ.get(f"{brand_key.upper()}_USER")
     env_p = os.environ.get(f"{brand_key.upper()}_PASS")
@@ -386,11 +397,17 @@ class Spider(BaseSpider):
 
                     for p in new_parts:
                         pid = p.get("partId", "")
+                        desc = (p.get("description") or "").strip()
                         rows.append(Row(
-                            item_name=(p.get("description") or "").strip(),
+                            item_name=desc,
                             item_code=(p.get("formattedPartNumber") or p.get("partNumber") or "").strip(),
                             mrp=mrp_map.get(pid),
+                            description=desc,  # explicit Description column (= item_name source)
                             compatible_car_model=" > ".join(new_crumb[:5]),  # cap breadcrumb depth
+                            # FDate/TDate live in dynamicColumns (Toyota: start/end of part
+                            # validity). Blank for parts with no date range — left as None.
+                            start_date=_dyn_col(p, "FDATE"),
+                            end_date=_dyn_col(p, "TDATE"),
                         ))
                 else:
                     # Branch — push to stack to recurse

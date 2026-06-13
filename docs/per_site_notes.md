@@ -1220,6 +1220,14 @@ This exceeds the BRD §8 8h SLA when combined with other brands' runs. **MRP can
 - Sort year nodes descending + cap with `i >= max_years` (avoids LIFO-stack picking the oldest year)
 - Capture `sbsepc5s`+`sbsepc5cs` from the first `/auth/account` request headers; replay via httpx
 
+**Additional fields added 2026-06-13 (Spinny scope extension — Toyota only)**:
+- `description` ← `partItems[].description` (same source as `item_name`; emitted as its own column per stakeholder ask)
+- `start_date` ← dynamicColumns `code=FDATE` (part validity start, e.g. "2022-11")
+- `end_date` ← dynamicColumns `code=TDATE` (part validity end; blank for in-production parts)
+- **Zero extra HTTP calls** — all three already present in the `/pages/parts/` response we fetch. Crawl time unchanged.
+- `start_date`/`end_date` are deliberately NOT in the required `fields` list (`config/sites.yaml`): a blank TDATE is legitimate (part still in production), so it must not flip rows to `partial`. They still appear in output when populated (same pattern as Lumax bonus-MRP).
+- Helper: `snapon_rest.py::_dyn_col(part, code)`.
+
 ---
 
 ### V2.3 Toyota — legacy notes (pre-2026-05-30 Playwright AG-Grid, kept for history)
@@ -1264,6 +1272,34 @@ This exceeds the BRD §8 8h SLA when combined with other brands' runs. **MRP can
 ### V2.4 Mahindra — ✅ FIXED 2026-05-22 (back-nav resilience added)
 
 **Fix 2026-05-22**: added `_renavigate_to_pv_root()` helper that re-issues `page.goto(FIGURE_URL)` before each top-level category iteration (skip on cat #1 since we're already there). Removed the unreliable trailing breadcrumb-back calls. Restart from known-good state every category instead of relying on stale breadcrumb DOM state. Estimated to recover row count to representative scope (~24,800).
+
+---
+
+### V2.4 Mahindra — 🔧 PART-LEVEL drill added 2026-06-13 (Spinny scope extension)
+
+**What changed**: previously the spider stopped at the **assembly** level (one row per assembly: `item_name=categoryname`, `item_code=figno`). Spinny asked for **part-level** data — Description, Start Date, End Date per part. Those fields do NOT exist on the assembly response; they live one drill deeper, in the per-assembly parts table.
+
+**Mechanism** (`spiders/mahindra.py::_drill_assemblies`):
+1. At each section's assembly grid, click an assembly thumbnail by name.
+2. The click fires a native **"search parts with prod date 13/Jun/2026"** confirm — auto-accepted via `page.on("dialog", lambda d: d.accept())` plus a best-effort in-page Yes/OK click (`_accept_confirm`) for the Angular-modal variant.
+3. The SPA then fires `POST /webapi/api/Illustration/GetIllustrationPartsJQ` → returns the parts list. Captured via `page.on("response")` (broadened from `/FigureSearch/` to `/webapi/api/`).
+4. **Clicking an assembly SWITCHES the view to parts-detail (the grid is hidden).** So between assemblies we click the section breadcrumb (`sp_name`) to re-render the grid, then click the next assembly. Verified reliable across 6 assemblies (distinct fignos, ~7s/assembly).
+
+**Field map (part grain)**:
+- `item_code` ← `partNo` (real part number, replaces figno)
+- `item_name` / `description` ← part `description`
+- `start_date` ← `startDate` (ISO → date, e.g. "2025-06-01")
+- `end_date` ← `endDate` (null for in-production parts → left blank, NOT required → no `partial`)
+- `part_structure` ← full breadcrumb `cat > variant > section > assembly_name (figno)` — satisfies "Complete Part Structure"
+- `compatible_car_model` ← `cat | variant`
+
+**Payload is encrypted** (`FigureSearchParm` AES blob), same as the whole Intelli Catalogue drill — confirmed we cannot replay/swap IDs to skip the UI. Every assembly requires a real UI click. This is the cost driver below.
+
+**⚠ VOLUME / RUNTIME** (the scope reality flagged to Spinny):
+- Assembly-grain default was ~24,800 rows in ~5h. Part-grain adds a click+dialog+parse+back-nav (~7s) **per assembly** (~40 assemblies/section).
+- Full representative scope (20 cats × 1 variant × 31 sections × ~40 assemblies) ≈ tens of hours — **exceeds the 8h BRD §8 window**. Run with reduced scope or split runs.
+- New knobs: `MAHINDRA_PART_LEVEL` (default 1; set 0 for old assembly grain), `MAHINDRA_MAX_ASSEMBLIES` (default 0=all — the main runtime lever). Existing `MAHINDRA_MAX_CATEGORIES/VARIANTS/SP_CATEGORIES` still apply.
+- Smoke (1 cat × 1 var × 1 sp × 2 asm): 11 parts, status=success, ~78s incl. login.
 
 ---
 
@@ -1346,6 +1382,18 @@ The default was bumped from `1/1/1` → `0/1/0` on 2026-05-19 after the drill ch
 **Status**: parts-leaf drill — **PRODUCTION DEFAULT**. The remaining open item (B8 in kickoff checklist) now only gates "full" scope (all variants), not the representative-scope production default.
 
 **MG sibling**: MG runs the same Intelli Catalogue v11.0 platform with the same drill APIs (Fillcategory, FillCategoryCountryModel, FillCatModelWithOutCountry, FillAssembly). MG's spider does an **adaptive recursive drill** — detects assemblies when `figno` is populated. See §V2.5.
+
+### V2.5 MG — 🔧 PART-LEVEL drill added 2026-06-13 (Spinny scope extension)
+
+Same change as Mahindra §V2.4 — MG runs the identical Intelli Catalogue v11.0 platform and the same `GetIllustrationPartsJQ` part-table endpoint. `spiders/mg.py::_drill_assemblies` mirrors Mahindra's, hooked into MG's **adaptive recursion** (the part-drill replaces the assembly-row emission inside the `if any(figno)` block).
+- Back-nav between assemblies clicks the **section breadcrumb = `path[-1]`** (the entry that produced the assemblies), then clicks the next assembly.
+- `part_structure` ← `MG > model > variant > sub-variant > section > assembly_name (figno)`.
+- Field map + date handling + bonus-date rationale identical to Mahindra.
+- Knobs: `MG_PART_LEVEL` (default 1), `MG_MAX_ASSEMBLIES` (default 0=all). Existing `MG_MAX_MODELS/VARIANTS/SP_CATEGORIES/MAX_DEPTH` still apply.
+- Smoke (1 model × 1 var × 1 section × 3 asm = MG Hector ENGINE): 59 parts, distinct fignos (BJ00-001/002/003), status=success, ~2 min incl. login.
+- Same **⚠ volume/runtime** caveat as Mahindra: part-grain × ~40 assemblies/section blows past the 8h window at full scope. Cap via `MG_MAX_ASSEMBLIES` or split runs.
+
+---
 
 ### V2.5 MG — ✅ shipped at REPRESENTATIVE PARTS-LEAF scope (default 2026-05-19)
 - URL: https://serviceconnect.mgmotorindia.com/epc/login (redirects from /epc/figure-search)

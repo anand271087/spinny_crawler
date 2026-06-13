@@ -81,6 +81,13 @@ class Spider(BaseSpider):
         self.max_cats = int(os.environ.get("MAHINDRA_MAX_CATEGORIES", "0") or "0")
         self.max_variants = int(os.environ.get("MAHINDRA_MAX_VARIANTS", "1") or "1")
         self.max_sp = int(os.environ.get("MAHINDRA_MAX_SP_CATEGORIES", "0") or "0")
+        # Part-level drill (2026-06-13): click each assembly → accept the prod-date
+        # dialog → GetIllustrationPartsJQ returns the parts table (partNo, description,
+        # startDate, endDate). Grain becomes per-part. Set MAHINDRA_PART_LEVEL=0 to
+        # revert to the cheaper assembly-grain rows. MAHINDRA_MAX_ASSEMBLIES caps
+        # assemblies drilled per section (0=all) — the main runtime lever now.
+        self.part_level = bool(int(os.environ.get("MAHINDRA_PART_LEVEL", "1") or "1"))
+        self.max_assemblies = int(os.environ.get("MAHINDRA_MAX_ASSEMBLIES", "0") or "0")
 
     def crawl(self) -> list[Row]:
         try:
@@ -101,21 +108,16 @@ class Spider(BaseSpider):
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=LAUNCH_ARGS)
-            ctx = browser.new_context(
-                user_agent=UA, viewport={"width": 1920, "height": 1080},
-                locale="en-US", timezone_id="Asia/Kolkata",
-            )
-            page = ctx.new_page()
-            page.add_init_script(INIT_SCRIPT)
-
-            # Capture FigureSearch API responses — these contain category/variant/assembly data
+            # Capture FigureSearch API responses — these contain category/variant/assembly data.
+            # GetIllustrationPartsJQ (Illustration controller) carries the part-level table.
             response_buf: dict[str, list[str]] = {
                 "Fillcategory": [], "FillCategoryCountryModel": [],
                 "FillCatModelWithOutCountry": [], "FillAssembly": [],
+                "GetIllustrationPartsJQ": [],
             }
 
             def on_resp(r):
-                if "/webapi/api/FigureSearch/" not in r.url:
+                if "/webapi/api/" not in r.url:
                     return
                 ct = r.headers.get("content-type", "")
                 if not any(t in ct for t in ("json", "text")):
@@ -129,16 +131,32 @@ class Spider(BaseSpider):
                         response_buf[key].append(body)
                         return
 
-            page.on("response", on_resp)
+            def open_session():
+                """Create a fresh context+page, attach handlers, log in, land on
+                FIGURE_URL. Returns (ctx, page) or (None, None). Reused for the
+                initial login and for the hard-reset fallback when the SPA session
+                gets corrupted by deep part-drilling (re-nav to PV root fails)."""
+                new_ctx = browser.new_context(
+                    user_agent=UA, viewport={"width": 1920, "height": 1080},
+                    locale="en-US", timezone_id="Asia/Kolkata",
+                )
+                new_page = new_ctx.new_page()
+                new_page.add_init_script(INIT_SCRIPT)
+                new_page.on("response", on_resp)
+                # Assembly click fires a native "search parts with prod date" confirm.
+                new_page.on("dialog", lambda d: d.accept())
+                if not self._login_with_retry(new_page, creds.user, creds.password, ocr):
+                    return None, None
+                new_page.goto(FIGURE_URL, wait_until="domcontentloaded", timeout=20_000)
+                new_page.wait_for_timeout(8000)
+                return new_ctx, new_page
 
             try:
-                if not self._login_with_retry(page, creds.user, creds.password, ocr):
+                ctx, page = open_session()
+                if page is None:
                     log.error("mahindra login failed")
                     return rows
                 log.info("mahindra login ok")
-
-                page.goto(FIGURE_URL, wait_until="domcontentloaded", timeout=20_000)
-                page.wait_for_timeout(8000)
 
                 # step 3: click Passenger Vehicles
                 response_buf["Fillcategory"].clear()
@@ -160,9 +178,25 @@ class Spider(BaseSpider):
                     # second on 2026-05-21 parallel run. See kickoff_checklist §I.I2.
                     if cat_idx > 1:
                         if not self._renavigate_to_pv_root(page, response_buf):
-                            log.error("[%d/%d] PV root re-nav failed; aborting Mahindra crawl",
-                                      cat_idx, len(cat_names))
-                            return rows
+                            # Deep part-drilling can corrupt the SPA session so a plain
+                            # re-goto + PV click no longer recovers. Hard-reset: drop the
+                            # context and log in fresh, rather than abort the whole crawl.
+                            log.warning("[%d/%d] PV root re-nav failed; hard-resetting "
+                                        "session (fresh login)", cat_idx, len(cat_names))
+                            try:
+                                ctx.close()
+                            except Exception:
+                                pass
+                            ctx, page = open_session()
+                            if page is None:
+                                log.error("[%d/%d] hard-reset re-login failed; aborting",
+                                          cat_idx, len(cat_names))
+                                return rows
+                            response_buf["Fillcategory"].clear()
+                            if not self._click_text(page, "Passenger Vehicles", wait=8000):
+                                log.error("[%d/%d] PV click failed after hard-reset; aborting",
+                                          cat_idx, len(cat_names))
+                                return rows
 
                     response_buf["FillCategoryCountryModel"].clear()
                     if not self._click_text(page, cat_name):
@@ -197,20 +231,26 @@ class Spider(BaseSpider):
                             log.info("      sp=%s → %d assemblies", sp_name, len(assemblies))
 
                             compat = f"{cat_name} | {variant_name} | {sp_name}"
-                            for a in assemblies:
-                                item_name = (a.get("categoryname") or "").strip()
-                                item_code = (a.get("figno") or "").strip()
-                                if not item_name or not item_code:
-                                    continue
-                                key = (item_code, compat)
-                                if key in seen:
-                                    continue
-                                seen.add(key)
-                                rows.append(Row(
-                                    item_name=item_name,
-                                    item_code=item_code,
-                                    compatible_car_model=compat,
-                                ))
+                            if self.part_level:
+                                self._drill_assemblies(
+                                    page, response_buf, assemblies, rows, seen,
+                                    cat_name, variant_name, sp_name,
+                                )
+                            else:
+                                for a in assemblies:
+                                    item_name = (a.get("categoryname") or "").strip()
+                                    item_code = (a.get("figno") or "").strip()
+                                    if not item_name or not item_code:
+                                        continue
+                                    key = (item_code, compat)
+                                    if key in seen:
+                                        continue
+                                    seen.add(key)
+                                    rows.append(Row(
+                                        item_name=item_name,
+                                        item_code=item_code,
+                                        compatible_car_model=compat,
+                                    ))
 
                             # Navigate back to sp-category list for next sp_name.
                             # Breadcrumb click on variant_name still usually works at
@@ -231,6 +271,92 @@ class Spider(BaseSpider):
                  len(rows), elapsed, elapsed / 3600)
         return rows
 
+    # ---------- part-level drill ----------
+
+    def _drill_assemblies(self, page: Page, response_buf: dict, assemblies: list[dict],
+                          rows: list[Row], seen: set, cat_name: str,
+                          variant_name: str, sp_name: str) -> None:
+        """Click each assembly in the section → accept the prod-date confirm →
+        capture GetIllustrationPartsJQ → emit one Row per part.
+
+        Clicking an assembly SWITCHES the view to the illustration/parts detail
+        (the assembly grid is hidden). So between assemblies we click the sp-category
+        name in the breadcrumb to re-render the grid before clicking the next one.
+        """
+        asms = [a for a in assemblies if (a.get("categoryname") or "").strip()]
+        if self.max_assemblies:
+            asms = asms[: self.max_assemblies]
+        compat = f"{cat_name} | {variant_name}"
+        for idx, a in enumerate(asms):
+            asm_name = (a.get("categoryname") or "").strip()
+            asm_figno = (a.get("figno") or "").strip()
+            # After the first drill we're on a parts-detail view; click the
+            # sp-category breadcrumb to return to the assembly grid.
+            if idx > 0:
+                if not self._click_text(page, sp_name, wait=3000):
+                    log.warning("        back-nav to %r grid failed at %d/%d; "
+                                "stopping section drill", sp_name, idx + 1, len(asms))
+                    break
+            response_buf["GetIllustrationPartsJQ"].clear()
+            if not self._click_text(page, asm_name, wait=2500):
+                continue
+            self._accept_confirm(page)
+            # parts XHR may arrive a beat after the dialog accept
+            if not response_buf["GetIllustrationPartsJQ"]:
+                page.wait_for_timeout(2500)
+            parts = self._parse(response_buf["GetIllustrationPartsJQ"])
+            log.info("        assembly=%s (figno=%s) → %d parts", asm_name, asm_figno, len(parts))
+            if not parts:
+                continue
+            structure = f"{cat_name} > {variant_name} > {sp_name} > {asm_name}"
+            if asm_figno:
+                structure += f" ({asm_figno})"
+            for pt in parts:
+                part_no = (pt.get("partNo") or "").strip()
+                pdesc = (pt.get("description") or "").strip()
+                if not part_no and not pdesc:
+                    continue
+                key = (part_no, structure)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(Row(
+                    item_name=pdesc or asm_name,
+                    item_code=part_no,
+                    description=pdesc,
+                    compatible_car_model=compat,
+                    part_structure=structure,
+                    start_date=self._fmt_date(pt.get("startDate")),
+                    end_date=self._fmt_date(pt.get("endDate")),
+                ))
+
+    @staticmethod
+    def _accept_confirm(page: Page) -> None:
+        """Best-effort click of an in-page Yes/OK confirm (the prod-date dialog is
+        sometimes an Angular modal rather than a native dialog). Native dialogs are
+        auto-accepted by the page.on('dialog') handler; this covers the modal case."""
+        try:
+            page.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll('button, a, .btn'));
+                const b = btns.find(el => {
+                    const t = (el.textContent||'').trim().toLowerCase();
+                    return (t === 'yes' || t === 'ok' || t === 'proceed') && el.offsetParent !== null;
+                });
+                if (b) b.click();
+            }""")
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
+
+    @staticmethod
+    def _fmt_date(val) -> str | None:
+        """Normalize an ISO datetime ('2025-06-01T00:00:00') to a date ('2025-06-01').
+        Returns None for null/blank (legit for in-production parts)."""
+        if not val:
+            return None
+        s = str(val).strip()
+        return s.split("T", 1)[0] if "T" in s else (s or None)
+
     # ---------- helpers ----------
 
     def _renavigate_to_pv_root(self, page: Page, response_buf: dict) -> bool:
@@ -239,7 +365,12 @@ class Spider(BaseSpider):
         breadcrumb-back fragility observed on 2026-05-21 (18+ skip-cat failures
         in a single second after a few successful drills).
         """
-        log.info("  re-nav to PV root")
+        # ONE quick attempt only. The full 2026-06-13 production run showed the
+        # deep part-drill corrupts the SPA session so a plain re-goto + PV click
+        # fails on ~15 of 19 transitions — repeated retries reliably fail too and
+        # just burn ~30s/transition. So we try once (it does recover on the
+        # occasional light transition, e.g. BOLERO/LOGAN-VERITO) and let the
+        # caller fall through to the fresh-login hard-reset when it fails.
         try:
             page.goto(FIGURE_URL, wait_until="domcontentloaded", timeout=20_000)
             page.wait_for_timeout(8000)
@@ -247,10 +378,10 @@ class Spider(BaseSpider):
             log.warning("  PV root re-nav: page.goto failed: %s", exc)
             return False
         response_buf["Fillcategory"].clear()
-        if not self._click_text(page, "Passenger Vehicles", wait=8000):
-            log.warning("  PV root re-nav: 'Passenger Vehicles' click failed")
-            return False
-        return True
+        if self._click_text(page, "Passenger Vehicles", wait=8000):
+            return True
+        log.info("  PV root re-nav: click failed → caller will hard-reset")
+        return False
 
     @staticmethod
     def _parse(payloads: list[str]) -> list[dict]:

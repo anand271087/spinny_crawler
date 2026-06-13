@@ -71,6 +71,10 @@ class Spider(BaseSpider):
         self.max_models = int(os.environ.get("MG_MAX_MODELS", "0") or "0")
         self.max_variants = int(os.environ.get("MG_MAX_VARIANTS", "1") or "1")
         self.max_sp = int(os.environ.get("MG_MAX_SP_CATEGORIES", "0") or "0")
+        # Part-level drill (2026-06-13): same GetIllustrationPartsJQ mechanism as
+        # Mahindra. Set MG_PART_LEVEL=0 to revert to assembly-grain rows.
+        self.part_level = bool(int(os.environ.get("MG_PART_LEVEL", "1") or "1"))
+        self.max_assemblies = int(os.environ.get("MG_MAX_ASSEMBLIES", "0") or "0")
 
     def crawl(self) -> list[Row]:
         try:
@@ -104,15 +108,25 @@ class Spider(BaseSpider):
             SKIP = {"GetUserNote", "GetModelDate"}
             last_list_response: dict[str, str] = {"body": ""}
             top_models: dict[str, str] = {"body": ""}
+            parts_buf: dict[str, str] = {"body": ""}
 
             def on_resp(r):
-                if "/webapi/api/FigureSearch/" not in r.url:
+                if "/webapi/api/" not in r.url:
                     return
                 ct = r.headers.get("content-type", "")
                 if not any(t in ct for t in ("json", "text")):
                     return
                 # endpoint name (last URL segment without query)
                 ep = r.url.split("?")[0].rsplit("/", 1)[-1]
+                # Part-level table (Illustration controller) — capture separately.
+                if ep == "GetIllustrationPartsJQ":
+                    try:
+                        parts_buf["body"] = r.text()
+                    except Exception:
+                        pass
+                    return
+                if "/webapi/api/FigureSearch/" not in r.url:
+                    return
                 if ep in SKIP:
                     return
                 try:
@@ -133,6 +147,8 @@ class Spider(BaseSpider):
                     pass
 
             page.on("response", on_resp)
+            # Assembly click fires a native "search parts with prod date" confirm.
+            page.on("dialog", lambda d: d.accept())
 
             try:
                 if not self._login_with_retry(page, creds.user, creds.password, ocr):
@@ -165,19 +181,23 @@ class Spider(BaseSpider):
                     """
                     if depth > int(os.environ.get("MG_MAX_DEPTH", "8") or "8"):
                         return
-                    # If any entry has figno populated, these ARE assemblies — extract.
+                    # If any entry has figno populated, these ARE assemblies.
                     if entries and any(e.get("figno") for e in entries):
-                        for a in entries:
-                            name = (a.get("categoryname") or "").strip()
-                            code = (a.get("figno") or "").strip()
-                            if not name or not code:
-                                continue
-                            compat = " | ".join(["MG"] + path)
-                            key = (code, compat)
-                            if key in seen:
-                                continue
-                            seen.add(key)
-                            rows.append(Row(item_name=name, item_code=code, compatible_car_model=compat))
+                        if self.part_level:
+                            self._drill_assemblies(page, parts_buf, entries, rows,
+                                                   seen, path)
+                        else:
+                            for a in entries:
+                                name = (a.get("categoryname") or "").strip()
+                                code = (a.get("figno") or "").strip()
+                                if not name or not code:
+                                    continue
+                                compat = " | ".join(["MG"] + path)
+                                key = (code, compat)
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                rows.append(Row(item_name=name, item_code=code, compatible_car_model=compat))
                         return
                     # Otherwise drill into each entry (respecting limits per level)
                     limit_map = {1: self.max_variants, 2: self.max_variants,
@@ -212,6 +232,84 @@ class Spider(BaseSpider):
         log.info("mg: %d items extracted in %.0fs (%.1f min)",
                  len(rows), elapsed, elapsed / 60)
         return rows
+
+    # ---------- part-level drill ----------
+
+    def _drill_assemblies(self, page: Page, parts_buf: dict, assemblies: list[dict],
+                          rows: list[Row], seen: set, path: list[str]) -> None:
+        """Click each assembly → accept the prod-date confirm → capture
+        GetIllustrationPartsJQ → emit one Row per part. Clicking an assembly
+        switches to the parts-detail view, so between assemblies we click the
+        section breadcrumb (path[-1]) to re-render the assembly grid.
+        """
+        section = path[-1] if path else None
+        asms = [a for a in assemblies if (a.get("categoryname") or "").strip()]
+        if self.max_assemblies:
+            asms = asms[: self.max_assemblies]
+        compat = " | ".join(["MG"] + path)
+        for idx, a in enumerate(asms):
+            asm_name = (a.get("categoryname") or "").strip()
+            asm_figno = (a.get("figno") or "").strip()
+            if idx > 0 and section:
+                if not self._click_text(page, section, wait=3000):
+                    log.warning("      back-nav to %r grid failed at %d/%d; "
+                                "stopping section drill", section, idx + 1, len(asms))
+                    break
+            parts_buf["body"] = ""
+            if not self._click_text(page, asm_name, wait=2500):
+                continue
+            self._accept_confirm(page)
+            if not parts_buf["body"]:
+                page.wait_for_timeout(2500)
+            parts = self._parse_one(parts_buf["body"])
+            log.info("      assembly=%s (figno=%s) → %d parts", asm_name, asm_figno, len(parts))
+            if not parts:
+                continue
+            structure = " > ".join(["MG"] + path + [asm_name])
+            if asm_figno:
+                structure += f" ({asm_figno})"
+            for pt in parts:
+                part_no = (pt.get("partNo") or "").strip()
+                pdesc = (pt.get("description") or "").strip()
+                if not part_no and not pdesc:
+                    continue
+                key = (part_no, structure)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(Row(
+                    item_name=pdesc or asm_name,
+                    item_code=part_no,
+                    description=pdesc,
+                    compatible_car_model=compat,
+                    part_structure=structure,
+                    start_date=self._fmt_date(pt.get("startDate")),
+                    end_date=self._fmt_date(pt.get("endDate")),
+                ))
+
+    @staticmethod
+    def _accept_confirm(page: Page) -> None:
+        """Best-effort click of an in-page Yes/OK confirm (modal variant). Native
+        dialogs are auto-accepted by the page.on('dialog') handler."""
+        try:
+            page.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll('button, a, .btn'));
+                const b = btns.find(el => {
+                    const t = (el.textContent||'').trim().toLowerCase();
+                    return (t === 'yes' || t === 'ok' || t === 'proceed') && el.offsetParent !== null;
+                });
+                if (b) b.click();
+            }""")
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
+
+    @staticmethod
+    def _fmt_date(val) -> str | None:
+        if not val:
+            return None
+        s = str(val).strip()
+        return s.split("T", 1)[0] if "T" in s else (s or None)
 
     # ---------- helpers ----------
 
