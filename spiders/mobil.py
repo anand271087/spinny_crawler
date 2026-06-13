@@ -64,8 +64,16 @@ class Spider(BaseSpider):
             ctx = browser.new_context(user_agent=USER_AGENT)
             page = ctx.new_page()
             page.on("request", on_request)
-            page.goto(PAGE_URL, wait_until="networkidle", timeout=60_000)
-            page.wait_for_timeout(6_000)
+            # NOTE: do NOT use wait_until="networkidle" — Mobil keeps background
+            # connections open (analytics/long-poll) so networkidle never fires and
+            # goto times out at 60s before the Coveo XHR is even read. Load on
+            # domcontentloaded, then poll for the captured Coveo POST (fires shortly
+            # after load as the search widget initializes).
+            page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60_000)
+            for _ in range(25):
+                if captured:
+                    break
+                page.wait_for_timeout(1_000)
 
             if not captured:
                 browser.close()
