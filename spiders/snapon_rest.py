@@ -143,57 +143,71 @@ def _playwright_login(brand_key: str, user: str, password: str):
     # pw_cm.__exit__() to clean up.
     pw_cm = sync_playwright()
     p = pw_cm.__enter__()
-    browser = p.chromium.launch(
-        headless=True,
-        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-    )
-    ctx = browser.new_context(
-        viewport={"width": 1920, "height": 1080},
-        user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
-    )
-    ctx.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-    )
-    page = ctx.new_page()
-    page.on("request", on_request)
-
-    log.info("%s: playwright login start", brand_key)
-    page.goto(f"{BASE}/epc/", wait_until="domcontentloaded", timeout=LOGIN_TIMEOUT_MS)
-    # Sometimes SNAP-ON's bundle takes ~7-10s to render the form
-    page.wait_for_selector("input[type=text]", state="visible", timeout=20_000)
-    page.wait_for_timeout(1500)
-    page.locator("input[type=text]").first.fill(user)
-    page.locator("input[type=password]").first.fill(password)
-    page.locator("button:has-text('Login')").first.click()
-    page.wait_for_timeout(POST_LOGIN_WAIT_MS)
-
-    body = page.locator("body").inner_text()
-    if "Logout" not in body:
-        browser.close()
-        pw_cm.__exit__(None, None, None)
-        raise RuntimeError(f"{brand_key}: login failed (no Logout link)")
-
-    # Give the SPA a moment to fire /auth/account so we capture headers
-    page.wait_for_timeout(ACCOUNT_WAIT_MS)
-    cookies = {c["name"]: c["value"] for c in ctx.cookies()}
-
-    auth_headers = {
-        k: captured[k]
-        for k in ("sbsepc5s", "sbsepc5cs", "x-client-version")
-        if k in captured
-    }
-    if "sbsepc5s" not in auth_headers or "sbsepc5cs" not in auth_headers:
-        browser.close()
-        pw_cm.__exit__(None, None, None)
-        raise RuntimeError(
-            f"{brand_key}: failed to capture session tokens "
-            f"(captured keys: {list(captured.keys())[:10]})"
+    browser = None
+    # CRITICAL: any failure after __enter__ must tear down pw_cm, else the
+    # Playwright driver/event-loop leaks and the NEXT sync_playwright() call
+    # throws "Sync API inside the asyncio loop" — which previously cascaded all
+    # 5 hard-reset retries to failure and crashed the run. Wrap everything.
+    try:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
         )
-    log.info("%s: tokens captured (sbsepc5s, sbsepc5cs, x-client-version)", brand_key)
-    return pw_cm, browser, ctx, page, auth_headers, cookies
+        ctx = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+        )
+        ctx.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        page = ctx.new_page()
+        page.on("request", on_request)
+
+        log.info("%s: playwright login start", brand_key)
+        page.goto(f"{BASE}/epc/", wait_until="domcontentloaded", timeout=LOGIN_TIMEOUT_MS)
+        # Sometimes SNAP-ON's bundle takes ~7-10s to render the form
+        page.wait_for_selector("input[type=text]", state="visible", timeout=20_000)
+        page.wait_for_timeout(1500)
+        page.locator("input[type=text]").first.fill(user)
+        page.locator("input[type=password]").first.fill(password)
+        page.locator("button:has-text('Login')").first.click()
+        page.wait_for_timeout(POST_LOGIN_WAIT_MS)
+
+        body = page.locator("body").inner_text()
+        if "Logout" not in body:
+            raise RuntimeError(f"{brand_key}: login failed (no Logout link)")
+
+        # Give the SPA a moment to fire /auth/account so we capture headers
+        page.wait_for_timeout(ACCOUNT_WAIT_MS)
+        cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+
+        auth_headers = {
+            k: captured[k]
+            for k in ("sbsepc5s", "sbsepc5cs", "x-client-version")
+            if k in captured
+        }
+        if "sbsepc5s" not in auth_headers or "sbsepc5cs" not in auth_headers:
+            raise RuntimeError(
+                f"{brand_key}: failed to capture session tokens "
+                f"(captured keys: {list(captured.keys())[:10]})"
+            )
+        log.info("%s: tokens captured (sbsepc5s, sbsepc5cs, x-client-version)", brand_key)
+        return pw_cm, browser, ctx, page, auth_headers, cookies
+    except Exception:
+        # Tear down fully so the next sync_playwright() starts clean.
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+        try:
+            pw_cm.__exit__(None, None, None)
+        except Exception:
+            pass
+        raise
 
 
 class Spider(BaseSpider):
@@ -222,16 +236,35 @@ class Spider(BaseSpider):
 
         user, password = _resolve_creds(self.brand_key)
         log.info("%s: credentials resolved user=%r", self.brand_key, user)
+        # Stash creds for the MRP hard-reset path (fresh re-login mid-crawl).
+        self._user, self._password = user, password
 
         # 1. Login — keep Playwright alive: MRP /picklist/validatePart calls
         # require browser TLS fingerprint (httpx 400s on those even with
         # identical headers — see module docstring "MRP STATUS").
-        pw_cm, browser, pw_ctx, pw_page, auth_headers, cookies = _playwright_login(
-            self.brand_key, user, password
-        )
-        # Stash for the helpers
+        # Retry the INITIAL login too — SNAP-ON intermittently renders the
+        # post-login page slowly ("no Logout link"); a single attempt would kill
+        # the whole run on a transient flake.
+        pw_cm = browser = pw_ctx = pw_page = auth_headers = cookies = None
+        for attempt in range(1, 6):
+            try:
+                pw_cm, browser, pw_ctx, pw_page, auth_headers, cookies = _playwright_login(
+                    self.brand_key, user, password
+                )
+                break
+            except Exception as e:
+                log.warning("%s: initial login attempt %d/5 failed: %s",
+                            self.brand_key, attempt, e)
+                time.sleep(20)
+        if pw_cm is None:
+            log.error("%s: initial login failed after 5 attempts — aborting", self.brand_key)
+            return []
+        # Stash for the helpers (these get swapped by _hard_reset_browser).
+        self._pw_cm = pw_cm
+        self._browser = browser
         self._pw_ctx = pw_ctx
         self._auth_headers = auth_headers
+        self._cookies = cookies
 
         # 2. httpx session for /navigations and /pages/parts (fast — no fingerprint check)
         headers = {
@@ -249,15 +282,74 @@ class Spider(BaseSpider):
             ) as client:
                 return self._crawl_via_rest(client, t_start)
         finally:
-            # Always clean up Playwright (even on exception)
+            # Always clean up Playwright (even on exception). Close the CURRENT
+            # browser/cm — they may have been swapped by a hard-reset.
             try:
-                browser.close()
+                self._browser.close()
             except Exception:
                 pass
             try:
-                pw_cm.__exit__(None, None, None)
+                self._pw_cm.__exit__(None, None, None)
             except Exception:
                 pass
+
+    def _hard_reset_browser(self, client: Optional[httpx.Client] = None) -> bool:
+        """Drop the corrupted Playwright session and log in fresh. Deep MRP
+        UI-warming corrupts the SPA after many sections (the warm drill starts
+        failing); a fresh login restores it. Mirrors the Mahindra hard-reset.
+
+        Swaps self._pw_cm/_browser/_pw_ctx/_auth_headers/_cookies and refreshes
+        the httpx nav client's auth headers + cookies with the new session.
+        Returns True on success.
+        """
+        log.warning("%s: hard-resetting browser session (fresh login)", self.brand_key)
+        try:
+            self._browser.close()
+        except Exception:
+            pass
+        try:
+            self._pw_cm.__exit__(None, None, None)
+        except Exception:
+            pass
+        # Retry the re-login through a transient network drop (ERR_INTERNET_
+        # DISCONNECTED etc.) — a brief blip must not kill a multi-hour run.
+        pw_cm = browser = pw_ctx = auth_headers = cookies = None
+        for attempt in range(1, 6):
+            try:
+                pw_cm, browser, pw_ctx, _pg, auth_headers, cookies = _playwright_login(
+                    self.brand_key, self._user, self._password
+                )
+                break
+            except Exception as e:
+                log.warning("%s: hard-reset re-login attempt %d/5 failed: %s",
+                            self.brand_key, attempt, e)
+                try:
+                    if browser:
+                        browser.close()
+                    if pw_cm:
+                        pw_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+                pw_cm = browser = None
+                time.sleep(30)
+        if pw_cm is None:
+            log.error("%s: hard-reset re-login failed after 5 attempts", self.brand_key)
+            return False
+        self._pw_cm = pw_cm
+        self._browser = browser
+        self._pw_ctx = pw_ctx
+        self._auth_headers = auth_headers
+        self._cookies = cookies
+        # Refresh nav client so subsequent /navigations + /pages/parts use the
+        # fresh sbsepc5s/cs too (the old JWT may have been invalidated on relogin).
+        if client is not None:
+            client.headers.update(auth_headers)
+            for k, v in cookies.items():
+                client.cookies.set(k, v)
+        # Drop cached warms — their captured headers hold the old session tokens.
+        if hasattr(self, "_warm_cache"):
+            self._warm_cache.clear()
+        return True
 
     def _crawl_via_rest(self, client: httpx.Client, t_start: float) -> list[Row]:
         # 3. Get account info (userId)
@@ -304,6 +396,10 @@ class Spider(BaseSpider):
         # 6. DFS walk of navigation tree, accumulating rows at leaf sections
         rows: list[Row] = []
         seen_part_ids: set[str] = set()
+        # Per-catalog warm cache: {catalog_id: (super_url, super_headers)}. One
+        # warm prices all sibling sections under a catalog. Cleared on hard-reset
+        # (cached headers carry the old session's sbsepc5s/cs).
+        self._warm_cache: dict[str, tuple] = {}
 
         # Stack of (serialized_path, breadcrumb_list, catalog_id)
         # catalog_id = numeric id of the parent "Catalog" level node, required
@@ -376,18 +472,35 @@ class Spider(BaseSpider):
                             seen_part_ids.add(pid)
                         new_parts.append(p)
 
-                    # MRP fetch: UI-drill the SPA into the section (warms server-
-                    # side session state), then parallel browser-fetch supersession
-                    # for all parts. See module docstring "MRP STATUS" for details.
+                    # MRP fetch: warm the SPA ONCE PER CATALOG, then browser-fetch
+                    # supersession for all parts. The supersession filterRequest is
+                    # catalog-level (equipmentRefId=catalog_id), so a single warm
+                    # prices every sibling section under that catalog — verified
+                    # 2026-06-14 (state/probe_catalog_warm.py). This cuts warms from
+                    # ~689 sections to ~a few dozen catalogs (~10x faster) AND fewer
+                    # UI drills → fewer SPA corruptions/hard-resets.
                     mrp_map: dict[str, Optional[float]] = {}
                     if new_parts and new_catalog_id and self.fetch_mrp:
-                        log.info("MRP: leaf crumb=%r catalog_id=%s, parts=%d",
-                                 new_crumb[:5], new_catalog_id, len(new_parts))
                         fr_leaf = self._build_filter_request(
                             ds_id, price_book_id, user_id, new_catalog_id
                         )
-                        # UI drill to set SPA section state — one click trail per leaf
-                        warmed = self._warm_section_ui(new_crumb[:5])
+                        warmed = False
+                        cached = self._warm_cache.get(new_catalog_id)
+                        if cached:
+                            # Reuse this catalog's captured supersession URL+headers.
+                            self._last_spa_super_url, self._spa_super_headers = cached
+                            warmed = True
+                        else:
+                            log.info("MRP: warming catalog_id=%s (crumb=%r)",
+                                     new_catalog_id, new_crumb[:5])
+                            # UI drill once; on SPA corruption hard-reset + retry.
+                            warmed = self._warm_section_ui(new_crumb[:5])
+                            if not warmed and self._hard_reset_browser(client):
+                                warmed = self._warm_section_ui(new_crumb[:5])
+                            if warmed:
+                                self._warm_cache[new_catalog_id] = (
+                                    self._last_spa_super_url, self._spa_super_headers,
+                                )
                         if warmed:
                             mrp_map = self._fetch_mrps_via_browser(
                                 ds_id, fr_leaf, new_parts, user_id, leaf_sp=node_sp,
@@ -461,6 +574,11 @@ class Spider(BaseSpider):
         After this returns True, supersession can be called for any partId
         belonging to this section via in-browser fetch (see _fetch_mrps_via_browser).
         """
+        # Guard: after a failed hard-reset the context may be dead (no pages).
+        # Return False rather than IndexError-crashing the whole crawl.
+        if not getattr(self, "_pw_ctx", None) or not self._pw_ctx.pages:
+            log.warning("warm: no live page (context dead) — skipping section")
+            return False
         page = self._pw_ctx.pages[0]
         try:
             # Reset to home so the next click sequence starts from a known state.
