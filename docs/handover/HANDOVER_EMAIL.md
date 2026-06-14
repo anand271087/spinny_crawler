@@ -23,7 +23,7 @@ Please find the complete handover for the Spinny OEM Spare-Parts Crawler. Everyt
 - Monthly batch crawler over **26 OEM / aftermarket brand sites** → per-brand CSV/JSON + one consolidated **master** file.
 - **20 brands** need no login; **6** need the dealer credentials I'll send separately.
 - A full run of all brands takes roughly **3.5–7 hours** (one site, ZF, is the slow one; there's a cache mode that cuts it to ~15 min after the first run).
-- Requires **Python 3.11+** and runs on macOS or Linux.
+- Requires **Python 3.11+** and runs on **macOS, Linux, or Windows** (on Windows, either native PowerShell or WSL2 — both covered in the install guide).
 
 **Fastest way to confirm it works after install:**
 ```

@@ -28,7 +28,7 @@ A full run of all 26 brands takes roughly **3.5–7 hours** depending on options
 
 | Component | Minimum | Recommended |
 |---|---|---|
-| OS | macOS 11+ **or** Ubuntu 22.04+ / Debian 12+ | same |
+| OS | macOS 11+ **or** Ubuntu 22.04+ / Debian 12+ **or** Windows 10/11 | macOS / Linux (or Windows via WSL2) |
 | Python | **3.11 or 3.12** (NOT 3.10 or earlier) | 3.11 |
 | RAM | 2 GB | 4 GB |
 | Disk | 10 GB free | 20 GB free |
@@ -45,10 +45,15 @@ git --version             # any recent version
 **If Python 3.11 is missing:**
 - **macOS:** `brew install python@3.11` (install Homebrew first from https://brew.sh if needed)
 - **Ubuntu/Debian:** `sudo apt update && sudo apt install -y python3.11 python3.11-venv python3.11-dev`
+- **Windows:** install from https://www.python.org/downloads/ (tick **"Add python.exe to PATH"** during setup), or `winget install Python.Python.3.11`
+
+> **Windows users:** the crawler runs on Windows — see **the "Windows users" box inside each step** below for the Windows command equivalents, and **Section 1.10** for the two recommended Windows approaches. The Python code is identical across all OSes; only the shell commands (venv activation, loading credentials, scheduling) differ.
 
 ---
 
 ## WAY 1 — Manual setup
+
+> **Windows readers:** Steps 1.1–1.9 below use macOS/Linux syntax. Each step's Windows (PowerShell) equivalent is given in Section **1.10**. If you'd rather not translate commands at all, the cleanest Windows route is **WSL2** (also in 1.10) — it lets you run the macOS/Linux commands verbatim.
 
 ### Step 1.1 — Open a terminal in the project folder
 ```bash
@@ -139,7 +144,60 @@ Runs everything with 4 parallel workers (~3.5–7 h). Output lands in `output/<d
 
 ---
 
+## 1.10 — Windows installation
+
+The crawler runs on Windows. Choose **one** of two approaches.
+
+### Approach A (recommended) — WSL2 (Windows Subsystem for Linux)
+
+WSL2 gives you a real Ubuntu environment inside Windows, so **all the macOS/Linux commands in Steps 1.1–1.9 work exactly as written**, including the optional cron scheduling.
+
+1. Open **PowerShell as Administrator** and run:
+   ```powershell
+   wsl --install -d Ubuntu
+   ```
+   Reboot if prompted, then launch **Ubuntu** from the Start menu and set a username/password.
+2. Inside the Ubuntu terminal, install prerequisites:
+   ```bash
+   sudo apt update && sudo apt install -y python3.11 python3.11-venv python3.11-dev git
+   ```
+3. Copy the unzipped project into WSL (e.g. `cp -r /mnt/c/Users/<you>/Downloads/spinny_crawler ~/` ), `cd` into it, and **follow Steps 1.1–1.9 verbatim** (remember `playwright install-deps chromium` is needed here).
+
+### Approach B — Native Windows (PowerShell)
+
+Use this if you don't want WSL. Same steps as 1.1–1.9, with these Windows equivalents:
+
+| Step | macOS / Linux | Windows (PowerShell) |
+|---|---|---|
+| Create venv | `python3.11 -m venv .venv` | `py -3.11 -m venv .venv` |
+| Activate venv | `source .venv/bin/activate` | `.venv\Scripts\Activate.ps1` |
+| Install deps | `pip install -e .[dev]` | `pip install -e ".[dev]"` |
+| Install browser | `playwright install chromium` | `playwright install chromium` (no `install-deps` needed) |
+| Run a brand | `python -m orchestrator.run_monthly --brands=zip` | `python -m orchestrator.run_monthly --brands=zip` |
+
+**If activation is blocked** ("running scripts is disabled"), allow it once for your user:
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+**Loading credentials on Windows.** There is no `source .env`. Either set each variable for the session:
+```powershell
+$env:HYUNDAI_USER="..."; $env:HYUNDAI_PASS="..."
+```
+…or load the whole `.env` file at once with this one-liner (run it after activating the venv, before crawling):
+```powershell
+Get-Content .env | Where-Object { $_ -match '^\s*[^#].+=' } | ForEach-Object { $k,$v = $_ -split '=',2; [Environment]::SetEnvironmentVariable($k.Trim(), $v.Trim()) }
+```
+
+**Scheduling on Windows (optional).** The `cron/` setup is Linux-only. On native Windows, use **Task Scheduler** to run, on your schedule, a small `.bat`/`.ps1` that does: `cd` to the project → activate the venv → load `.env` → `python -m orchestrator.run_monthly`. (Under WSL2, the normal cron instructions in `docs/deployment.md` work.)
+
+> **Note on speed:** native Windows and WSL2 perform comparably for this workload. Pick WSL2 if you also want the monthly cron; pick native if you just run it on demand.
+
+---
+
 ## WAY 2 — Claude Code assisted setup
+
+> **Works on Windows too** — Claude Code runs on Windows (PowerShell or WSL2). It will detect your OS and give you the correct commands automatically. WSL2 is still the smoothest underlying environment.
 
 If you'd rather have an AI assistant do the setup and answer questions as you go, use **Claude Code** (Anthropic's terminal coding agent). The project ships with a `CLAUDE.md` file that already documents every rule and command, so Claude Code can install and verify the project for you.
 
