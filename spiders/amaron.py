@@ -174,9 +174,14 @@ class Spider(BaseSpider):
                 continue
             item_name = m.group(1).strip()
             item_code = m.group(2).strip()
-            if item_code in seen_codes:
+            # Dedup per (battery, vehicle) — NOT globally on item_code. A battery
+            # SKU fits many vehicles; the old global dedup kept only the first
+            # vehicle per SKU (~52 rows total) and discarded the full compatibility
+            # matrix. Keep every (SKU × make × model × fuel) combination.
+            key = (item_code, compat)
+            if key in seen_codes:
                 continue
-            seen_codes.add(item_code)
+            seen_codes.add(key)
             mrp = mrps[i] if i < len(mrps) else None
             rows.append(Row(
                 item_name=item_name,
