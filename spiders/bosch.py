@@ -149,31 +149,90 @@ class Spider(BaseSpider):
     # ------------------------------------------------------------------ line-format
     def _parse_line_format(self, category: str, pdf_bytes: bytes,
                            seen_codes: set[str]) -> list[Row]:
+        """TABLE-based parser (rewritten 2026-06-14).
+
+        These catalogues render as multi-column tables:
+            [Part Number | Product Description | Image | Model Description | MRP (₹)]
+        The previous regex-on-extract_text() approach flattened the columns and
+        scrambled part number / name / model / MRP into each other (garbage output,
+        and it wrongly emitted an out-of-contract compatible_car_model).
+
+        We now use extract_tables() and locate columns by header text, scanning ALL
+        pages (the parts tables are not always on the first "passenger car" page —
+        some pages are HSN/Contents). Per Bosch's field contract [item_name,
+        item_code, mrp] we do NOT emit compatible_car_model.
+        """
         rows: list[Row] = []
-        in_passenger_section = False
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
-                text = page.extract_text() or ""
-                if "passenger car" in text.lower():
-                    in_passenger_section = True
-                if re.search(r"\b(two[\s-]?wheel|commercial vehicle|cross reference chart)\b",
-                             text, re.IGNORECASE):
-                    if in_passenger_section and "passenger car" not in text.lower():
-                        in_passenger_section = False
-                if not in_passenger_section:
-                    continue
-                for parsed in self._parse_lines(text):
-                    code = parsed["item_code"]
-                    if code in seen_codes:
+                for table in page.extract_tables() or []:
+                    if not table or len(table) < 2:
                         continue
-                    seen_codes.add(code)
-                    rows.append(Row(
-                        item_name=parsed["item_name"],
-                        item_code=code,
-                        mrp=parsed["mrp"],
-                        compatible_car_model=parsed["model"],
-                    ))
+                    hdr = self._find_header_row(table)
+                    if hdr is None:
+                        continue
+                    header_row, cols = hdr
+                    pn_col, desc_col, mrp_col = cols["pn"], cols["desc"], cols["mrp"]
+                    started = False
+                    for raw in table:
+                        if not started:
+                            if raw is header_row:
+                                started = True
+                            continue
+                        cells = [(c or "").strip() for c in raw]
+                        if pn_col >= len(cells):
+                            continue
+                        pn = " ".join(cells[pn_col].split())
+                        if not BOSCH_PN_SPACED_RE.fullmatch(pn):
+                            continue  # not a real Bosch part number → skip (no garbage)
+                        if pn in seen_codes:
+                            continue
+                        seen_codes.add(pn)
+                        name = ""
+                        if desc_col is not None and desc_col < len(cells):
+                            name = " ".join(cells[desc_col].split())
+                        mrp_val = None
+                        if mrp_col is not None and mrp_col < len(cells):
+                            mrp_val = self._parse_mrp(cells[mrp_col])
+                        rows.append(Row(
+                            item_name=name or f"Bosch Part {pn}",
+                            item_code=pn,
+                            mrp=mrp_val,
+                        ))
         return rows
+
+    @staticmethod
+    def _find_header_row(table: list) -> tuple | None:
+        """Locate the header row and the Part-Number / Product-Description / MRP
+        column indices. Returns (header_row, {pn,desc,mrp}) or None if not a parts table."""
+        for row in table:
+            if not row:
+                continue
+            joined = " ".join((c or "").lower().replace("\n", " ") for c in row)
+            if "part" in joined and "number" in joined and ("mrp" in joined or "description" in joined):
+                pn = desc = mrp = None
+                for ci, cell in enumerate(row):
+                    cl = (cell or "").lower().replace("\n", " ")
+                    if "part" in cl and "number" in cl and pn is None:
+                        pn = ci
+                    elif "product" in cl and "description" in cl and desc is None:
+                        desc = ci
+                    elif "mrp" in cl and mrp is None:
+                        mrp = ci
+                if pn is not None:
+                    return row, {"pn": pn, "desc": desc, "mrp": mrp}
+        return None
+
+    @staticmethod
+    def _parse_mrp(cell: str):
+        s = (cell or "").strip()
+        if not s or "request" in s.lower():
+            return None
+        s = re.sub(r"[₹,\s]", "", s)
+        try:
+            return float(s)
+        except ValueError:
+            return None
 
     @staticmethod
     def _parse_lines(text: str) -> Iterable[dict]:
