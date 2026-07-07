@@ -42,10 +42,20 @@ Each run creates `output/<date>/` with one file per brand plus `spinny_oem_maste
 
 ---
 
+### Latest additional data points — also delivered
+
+Beyond the original scope, the recently requested extra data points for the OEM EPC brands are **built, run end-to-end, and included** in this handover:
+
+- **Mahindra** — now extracts **per-part** data: Description, Complete Part Structure, and Start Date for every part (drills into each assembly, not just the assembly summary). Verified full run: **28,222 parts**.
+- **MG** — same per-part extraction (Description, Part Structure, Start Date). Verified full run: **10,281 parts**.
+- **Toyota** — added **Description** and **Start/End dates** per part (sourced from the existing catalogue response, so no extra crawl time). Verified full run: **26,820 parts**.
+- **Hyundai** — **MRP/price is now captured** (it wasn't before). Verified full run: **17,306 parts with ~76% MRP coverage** (the remaining ~24% are genuinely price-less on the site), in ~45 minutes.
+
+These were validated on real full runs and the new fields are populated in the per-brand files and folded into the consolidated master.
+
 ### Status & a few things to know
 
-- **Fully delivered:** all 26 spiders are working and were run end-to-end recently. The latest consolidated master has ~130K+ de-duplicated rows across all brands.
-- **Hyundai MRP:** now captured at ~**76% coverage** (the rest are genuinely price-less on the site).
+- **Fully delivered:** all 26 spiders are working and were run end-to-end recently. The latest consolidated master has ~130K+ de-duplicated rows across all brands, now including the Hyundai prices and the Mahindra/MG/Toyota part-level fields above.
 - **Two known limitations** (not bugs in the crawler):
   - **Toyota MRP** is empty because the dealer account's price book is unpopulated server-side — this needs Spinny's commercial team to enable pricing on that credential.
   - **Maruti "car model"** isn't currently extracted (the public API returns parts without per-model compatibility). Capturing it would need additional per-model iteration — happy to scope this if it's required.
