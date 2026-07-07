@@ -57,8 +57,19 @@ PV_BREADCRUMB_PREFIXES = {
 }
 MAX_PAGES_PER_CATEGORY = 200  # Safety cap; site is 6 products/page
 
-DETAIL_CONCURRENCY = 8  # parallel detail fetches; tuned to be polite (BRD §7)
+DETAIL_CONCURRENCY = 4  # parallel detail fetches; lowered 2026-07 — the Hella
+                        # server drops connections (RemoteProtocolError) under higher
+                        # concurrency / rapid pagination.
 DETAIL_TIMEOUT = 30.0
+REQUEST_DELAY = 0.4     # polite gap between sequential listing-page fetches
+GET_RETRIES = 4         # retry transient server disconnects with backoff
+# Transient network/server errors the Hella site throws under load. Caught +
+# retried by _get(); previously an uncaught RemoteProtocolError on a listing
+# fetch crashed the whole spider → 0 rows.
+RETRYABLE_ERRORS = (
+    httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError,
+    httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout, httpx.WriteError,
+)
 
 # Detail-page regex extractors
 MRP_RE = re.compile(r"MRP\s*:?\s*Rs\.?\s*([\d,]+)", re.IGNORECASE)
@@ -108,13 +119,38 @@ class Spider(BaseSpider):
                 rows.extend(cat_rows)
         return rows
 
+    @staticmethod
+    async def _get(client: httpx.AsyncClient, url: str):
+        """GET with backoff retry on transient server disconnects. Returns the
+        response or None after GET_RETRIES failures (caller decides how to handle).
+        The Hella server intermittently drops connections under load — one uncaught
+        RemoteProtocolError previously crashed the entire spider."""
+        delay = 1.0
+        for attempt in range(1, GET_RETRIES + 1):
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                return resp
+            except RETRYABLE_ERRORS as exc:
+                if attempt == GET_RETRIES:
+                    log.warning("hella GET failed after %d tries: %s (%s)",
+                                GET_RETRIES, url, exc)
+                    return None
+                await asyncio.sleep(delay)
+                delay *= 2
+            except httpx.HTTPStatusError as exc:
+                log.warning("hella GET %s → %s", url, exc)
+                return None
+        return None
+
     async def _discover_4w_categories(self, client: httpx.AsyncClient) -> set[str]:
         """Return the union of category slugs listed on the PCA + PCS sub-segment pages."""
         categories: set[str] = set()
         for seg_path in SEGMENT_PAGES:
             url = urljoin(BASE, seg_path)
-            resp = await client.get(url)
-            resp.raise_for_status()
+            resp = await self._get(client, url)
+            if resp is None:
+                continue
             sel = Selector(resp.text)
             for href in sel.css("a::attr(href)").getall():
                 if seg_path in href:
@@ -138,11 +174,13 @@ class Spider(BaseSpider):
             url = urljoin(BASE, LISTING_TEMPLATE.format(category=category)) + (
                 f"/{page}" if page > 1 else ""
             )
-            resp = await client.get(url)
-            resp.raise_for_status()
+            resp = await self._get(client, url)
+            if resp is None:
+                break  # give up this category cleanly instead of crashing the spider
             cards = self._parse_cards(resp.text)
             if not cards:
                 break
+            await asyncio.sleep(REQUEST_DELAY)  # throttle to avoid server drops
             new_in_page = 0
             for card in cards:
                 if card["item_code"] in seen_codes:
@@ -174,12 +212,8 @@ class Spider(BaseSpider):
         detail_url = card.get("detail_url") or ""
         if not detail_url:
             return None
-        try:
-            r = await client.get(detail_url)
-        except httpx.HTTPError as exc:
-            log.warning("hella detail fetch failed: %s (%s)", detail_url, exc)
-            return None
-        if r.status_code != 200:
+        r = await self._get(client, detail_url)
+        if r is None:
             return None
         sel = Selector(r.text)
 
